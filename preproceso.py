@@ -34,7 +34,7 @@ def _obtener_modelo(nombre_modelo):
 
 
 def dividir_mensajes(df, col_post="Post"):
-    """Expande listas de mensajes en filas individuales, descartando entradas vacías."""
+    """Expande listas de mensajes en filas individuales, conservando el ID del usuario."""
     def parsear(crudo):
         try:
             lista = ast.literal_eval(crudo)
@@ -46,6 +46,7 @@ def dividir_mensajes(df, col_post="Post"):
             return _RE_SPLIT_LISTA.split(s)
 
     out = df.copy()
+    out["user_id"] = out.index
     out[col_post] = out[col_post].apply(parsear)
     out = out.explode(col_post, ignore_index=True).dropna(subset=[col_post])
     out[col_post] = out[col_post].astype(str).str.strip()

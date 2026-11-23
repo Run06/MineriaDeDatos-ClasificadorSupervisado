@@ -1,12 +1,11 @@
 import argparse
 import sys
 import pandas as pd
-from sklearn.metrics import classification_report, f1_score
 from sklearn.model_selection import train_test_split
-from sklearn.svm import SVC
 
 from preproceso import dividir_mensajes, vectorizar_embeddings
 from re_etiquetado import cascading_self_training
+from eval import entrenar_y_evaluar
 
 
 def parse_args():
@@ -26,50 +25,28 @@ def cargar_csv(ruta):
     except FileNotFoundError:
         print(f"Error: El archivo '{ruta}' no existe o la ruta es incorrecta.")
         sys.exit(1)
-def entrenar_y_evaluar(titulo, X_tr, y_tr, X_dev_vec, y_dev, X_test_vec, y_test):
-    print("\n" + "=" * 50)
-    print(f"MODELO: {titulo} (Train: {len(y_tr)} mensajes)")
-    print("=" * 50)
-
-    svc_model = SVC(
-        kernel="rbf",
-        C=2.0,
-        gamma="scale",
-        class_weight="balanced",
-        random_state=42,
-    )
-    svc_model.fit(X_tr, y_tr)
-
-    preds_dev = svc_model.predict(X_dev_vec)
-    print(f"Macro F1-Score - Dev:  {f1_score(y_dev, preds_dev, average='macro', zero_division=0):.4f}")
-
-    preds_test = svc_model.predict(X_test_vec)
-    print(f"Macro F1-Score - Test: {f1_score(y_test, preds_test, average='macro', zero_division=0):.4f}")
-
-    print("\nReporte de clasificación Test")
-    print(classification_report(y_test, preds_test, zero_division=0))
-
 
 def main():
     args = parse_args()
 
     raw_data = cargar_csv(args.file)
-    data = dividir_mensajes(raw_data)
-    X = data[args.target]
-    y = data[args.label]
-
-    print(f"Dimensiones del dataset cargado: {data.shape}")
-
-    # Partición estratificada: 70% Train / 15% Dev / 15% Test
-    X_train_full, X_test, y_train_full, y_test = train_test_split(
-        X, y, test_size=0.15, random_state=42, stratify=y
+    print(f"Usuarios totales cargados: {len(raw_data)}")
+    train_users, test_users = train_test_split(
+        raw_data, test_size=0.15, random_state=42, stratify=raw_data[args.label]
     )
-    X_train, X_dev, y_train, y_dev = train_test_split(
-        X_train_full, y_train_full, test_size=(15 / 85), random_state=42, stratify=y_train_full
+    train_users, dev_users = train_test_split(
+        train_users, test_size=(15 / 85), random_state=42, stratify=train_users[args.label]
     )
 
-    print("Tamaños de las particiones (70% / 15% / 15%)")
-    print(f"Train: {len(X_train)}, Dev: {len(X_dev)}, Test: {len(X_test)}")
+    print("Partición de USUARIOS (70% / 15% / 15%):")
+    print(f"  Train: {len(train_users)} usuarios | Dev: {len(dev_users)} usuarios | Test: {len(test_users)} usuarios")
+    #Explotar mensajes por separado (cero fuga de datos entre particiones)
+    train_msgs = dividir_mensajes(train_users, col_post=args.target)
+    dev_msgs = dividir_mensajes(dev_users, col_post=args.target)
+    test_msgs = dividir_mensajes(test_users, col_post=args.target)
+
+    print("Partición de MENSAJES:")
+    print(f"  Train: {len(train_msgs)} | Dev: {len(dev_msgs)} | Test: {len(test_msgs)}")
 
     mensajes_semilla = cargar_csv(args.seed)
     print(f"Semillas manuales cargadas: {len(mensajes_semilla)}")
@@ -77,16 +54,19 @@ def main():
     X_seed = mensajes_semilla[args.target]
     y_seed = mensajes_semilla[args.label].values
 
+    X_train = train_msgs[args.target]
+    y_train = train_msgs[args.label]
+
     # Vectorización
     X_train_combinado = pd.concat([X_seed, X_train], ignore_index=True)
     print("\nCalculando embeddings para el conjunto de entrenamiento combinado...")
     X_train_combinado_vec = vectorizar_embeddings(X_train_combinado)
 
     print("Calculando embeddings para Dev...")
-    X_dev_vec = vectorizar_embeddings(X_dev)
+    X_dev_vec = vectorizar_embeddings(dev_msgs[args.target])
 
     print("Calculando embeddings para Test...")
-    X_test_vec = vectorizar_embeddings(X_test)
+    X_test_vec = vectorizar_embeddings(test_msgs[args.target])
 
     num_semillas = len(X_seed)
     X_seed_vec = X_train_combinado_vec[:num_semillas]
@@ -99,20 +79,21 @@ def main():
         X_unlabeled=X_reddit_vec,
         y_unlabeled_orig=y_train.values,
         textos_unlabeled=X_train.values,
-        umbrales=(0.95, 0.90, 0.85, 0.80, 0.75),
+        umbrales=(0.95, 0.90, 0.85, 0.80, 0.75,0.70),
         max_iter_interna=10,
         factor_balanceo=2,
     )
 
     entrenar_y_evaluar(
         "SOLO RE-ETIQUETADOS (+ SEMILLAS)",
-        X_train_clean, y_train_clean, X_dev_vec, y_dev, X_test_vec, y_test
+        X_train_clean, y_train_clean, X_dev_vec, dev_msgs, X_test_vec, test_msgs, args.label,
+        ventanas_k=(1, 3, 5, 10, 15, None),
     )
     entrenar_y_evaluar(
         "COMPLETO (RE-ETIQUETADOS + FALLBACK)",
-        X_train_full, y_train_full, X_dev_vec, y_dev, X_test_vec, y_test
+        X_train_full, y_train_full, X_dev_vec, dev_msgs, X_test_vec, test_msgs, args.label,
+        ventanas_k=(1, 3, 5, 10, 15, None),
     )
-
 
 if __name__ == "__main__":
     main()
