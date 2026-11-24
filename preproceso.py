@@ -1,3 +1,4 @@
+from gensim.models import FastText
 import ast
 import hashlib
 import os
@@ -137,3 +138,43 @@ def vectorizar_embeddings(
     return _vectorizar_por_trozos(
         textos, firma, "vectores", cache_dir, chunk_palabras, max_chunks, codificar, normalizar=True
     )
+
+def clean_text_ft(text):
+    """Limpieza ligera SIN stemming (FastText ya aprovecha subpalabras)."""
+    text = _RE_URL.sub("", str(text).lower())
+    return re.sub(r"[^a-z\s']", " ", text).split()
+
+
+def _doc_vectors(modelo, docs_tokens):
+    M = np.zeros((len(docs_tokens), modelo.vector_size), dtype=np.float32)
+    for i, tokens in enumerate(docs_tokens):
+        if tokens:
+            M[i] = np.mean([modelo.wv[t] for t in tokens], axis=0)
+    normas = np.linalg.norm(M, axis=1, keepdims=True)
+    normas[normas == 0] = 1.0
+    return M / normas                      # DENSO, L2-normalizado
+
+
+def fasttext_vec(X_train, X_dev, X_test, dim=100, epochs=15, window=5, min_count=2):
+    tok_train = [clean_text_ft(t) for t in X_train]
+    tok_dev = [clean_text_ft(t) for t in X_dev]
+    tok_test = [clean_text_ft(t) for t in X_test]
+
+    ft = FastText(sentences=tok_train, vector_size=dim, window=window,
+                  min_count=min_count, epochs=epochs, sg=1,
+                  min_n=3, max_n=6, seed=42, workers=1)  # workers=1 => reproducible
+    return (_doc_vectors(ft, tok_train),
+            _doc_vectors(ft, tok_dev),
+            _doc_vectors(ft, tok_test))
+
+
+def vectorizar(nombre, X_train, X_dev, X_test):
+    if nombre == "tfidf":
+        return tfidf(X_train, X_dev, X_test)          # sparse
+    if nombre == "fasttext":
+        return fasttext_vec(X_train, X_dev, X_test)   # denso
+    if nombre == "embeddings":
+        return (vectorizar_embeddings(X_train),
+                vectorizar_embeddings(X_dev),
+                vectorizar_embeddings(X_test))        # denso
+    raise ValueError(f"Vectorización no soportada: {nombre}")
