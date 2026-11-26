@@ -7,9 +7,17 @@ import torch
 from nltk import SnowballStemmer, word_tokenize
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-MODELO_EMBEDDINGS = "paraphrase-multilingual-MiniLM-L12-v2"
-CHUNK_PALABRAS = 80   # ~100-110 tokens, por debajo del límite de 128
-MAX_CHUNKS = 50       # Tope de trozos por instancia
+#Para baseline
+#MODELO_EMBEDDINGS = "paraphrase-multilingual-MiniLM-L12-v2"
+#CHUNK_PALABRAS = 80
+#MAX_CHUNKS = 50
+#Para BiLSTM
+#MODELO_EMBEDDINGS = "mental/mental-roberta-base"
+#CHUNK_PALABRAS = 300
+#MAX_CHUNKS = 50
+MODELO_EMBEDDINGS = "mental/mental-roberta-base"
+CHUNK_PALABRAS = 300
+MAX_CHUNKS = 50
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Expresiones regulares precompiladas
