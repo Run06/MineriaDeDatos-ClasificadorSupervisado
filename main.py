@@ -3,12 +3,18 @@ import os
 import shutil
 import sys
 import time
+import hashlib
+import json
+from datetime import datetime
+from pathlib import Path
+import numpy as np
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
 from eval import entrenar_y_evaluar
-from medicion import imprimir_resumen, medir, ram_mb
+from medicion import imprimir_resumen, medir, ram_mb, exportar_mediciones, RESUMEN
+from graficas import caracterizar, graficas_evaluacion, grafica_recursos, graficas_cascada
 from preproceso import dividir_mensajes, vectorizar
 from re_etiquetado import cascading_self_training
 
@@ -23,12 +29,14 @@ def parse_args():
     parser.add_argument("-t", "--target", default="Post", help="Columna de texto a clasificar")
     parser.add_argument("-l", "--label", default="Label", help="Columna de etiquetas")
     parser.add_argument("-s", "--seed", default="semilla.csv", help="Archivo CSV con instancias semilla")
-    parser.add_argument("-m", "--model", choices=["svm_linear", "svm_rbf", "rf"],
+    parser.add_argument("-m", "--model", choices=["svm_linear", "svm_rbf", "rf", "mlp"],
                         default="svm_linear", help="Clasificador final")
     parser.add_argument("-v", "--vectorizer", choices=["fasttext", "embeddings"],
                         default="embeddings", help="Vectorización")
     parser.add_argument("--limpiar-cache", action="store_true",
                         help="Borra la carpeta 'cache' antes de ejecutar (medición en frío)")
+    parser.add_argument("--resultados", default="resultados", help="Carpeta de exportación")
+    parser.add_argument("--baseline-original", action="store_true", help="Añade control con etiquetas originales y las mismas semillas")
     return parser.parse_args()
 
 
@@ -42,6 +50,7 @@ def cargar_csv(ruta):
 
 def main():
     args = parse_args()
+    RESUMEN.clear()
     t_total = time.perf_counter()
 
     if args.limpiar_cache and os.path.isdir(CACHE_DIR):
@@ -95,7 +104,7 @@ def main():
 
     # Re-etiquetado en cascada
     with medir("Re-etiquetado en cascada"):
-        X_train_clean, y_train_clean, X_train_full, y_train_full = cascading_self_training(
+        X_train_clean, y_train_clean, X_train_full, y_train_full, historial = cascading_self_training(
             X_seed=X_seed_vec,
             y_seed=y_seed,
             X_unlabeled=X_reddit_vec,
@@ -105,21 +114,52 @@ def main():
             max_iter_interna=10,
             factor_balanceo=2,
             cache_dir=CACHE_DIR,
+            devolver_historial=True,
         )
 
     ventanas_k = (1, 3, 5, 10, 15, None)
-    entrenar_y_evaluar(
-        "SOLO RE-ETIQUETADOS (+ SEMILLAS)", args.model,
-        X_train_clean, y_train_clean, X_dev_vec, dev_msgs, X_test_vec, test_msgs, args.label,
-        ventanas_k=ventanas_k,
-    )
-    entrenar_y_evaluar(
-        "COMPLETO (RE-ETIQUETADOS + FALLBACK)", args.model,
-        X_train_full, y_train_full, X_dev_vec, dev_msgs, X_test_vec, test_msgs, args.label,
-        ventanas_k=ventanas_k,
-    )
+    estrategias = [("Solo pseudo", X_train_clean, y_train_clean),
+                   ("Con fallback", X_train_full, y_train_full)]
+    if args.baseline_original:
+        estrategias.append(("Etiquetas originales", X_train_combinado_vec,
+                            np.concatenate([y_seed, y_train.values])))
+    clases_eval = np.unique(np.concatenate([raw_data[args.label].values, y_seed]))
+    metricas, por_clase, matrices = [], [], []
+    for titulo, X, y in estrategias:
+        m, c, cm = entrenar_y_evaluar(titulo, args.model, X, y, X_dev_vec, dev_msgs,
+                                      X_test_vec, test_msgs, args.label,
+                                      ventanas_k=ventanas_k, clases_eval=clases_eval)
+        metricas.extend(m)
+        por_clase.extend(c)
+        matrices.extend(cm)
 
-    imprimir_resumen(time.perf_counter() - t_total)
+    segundos = time.perf_counter() - t_total
+    imprimir_resumen(segundos)
+    # Exportar fuera de las mediciones del pipeline: no penalizar al modelo por dibujar.
+    salida = Path(args.resultados) / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") +
+                                     f"_{args.vectorizer}_{args.model}")
+    salida.mkdir(parents=True, exist_ok=False)
+    met, pc, cm = map(pd.DataFrame, (metricas, por_clase, matrices))
+    for nombre, df in [("metricas", met), ("metricas_por_clase", pc), ("confusiones", cm)]:
+        df.to_csv(salida / f"{nombre}.csv", index=False)
+    exportar_mediciones(salida / "recursos.csv")
+    caracterizar([("Train", train_users, train_msgs), ("Dev", dev_users, dev_msgs),
+                  ("Test", test_users, test_msgs)], args.target, args.label, salida)
+    graficas_evaluacion(met, pc, cm, salida)
+    grafica_recursos(pd.read_csv(salida / "recursos.csv"), salida)
+    graficas_cascada(historial, len(X_train), (0.95, 0.90, 0.85, 0.80, 0.75, 0.70), salida)
+    firma = hashlib.sha256()
+    for ruta in (args.file, args.seed):
+        firma.update(hashlib.sha256(Path(ruta).read_bytes()).digest())
+    firma.update(f"{args.target}|{args.label}|split42_70_15_15".encode())
+    config = dict(vectorizer=args.vectorizer, model=args.model,
+                  modo_cache="frio" if args.limpiar_cache else "normal",
+                  baseline_original=args.baseline_original, firma_datos=firma.hexdigest(),
+                  segundos_pipeline=segundos, semillas=len(y_seed),
+                  mensajes_train_original=len(y_train), pseudoetiquetados=len(y_train_clean)-len(y_seed),
+                  fallback=len(y_train_full)-len(y_train_clean))
+    (salida / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    print(f"Gráficas y CSV guardados en: {salida}")
 
 
 if __name__ == "__main__":

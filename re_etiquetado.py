@@ -15,16 +15,19 @@ def cascading_self_training(
     min_palabras=8,
     random_state=42,
     cache_dir="cache",
+    devolver_historial=False,
 ):
     """
     Ejecuta un bucle de pseudo-etiquetado en cascada con balanceo relativo y filtro de longitud.
     """
+    historial = []
     # --- CACHÉ ---
     ruta_cache = None
     if cache_dir is not None:
         hasher = hashlib.md5()
-        firma = f"{tuple(umbrales)}|{max_iter_interna}|{factor_balanceo}|{min_palabras}|{random_state}"
+        firma = f"historial_v1|{tuple(umbrales)}|{max_iter_interna}|{factor_balanceo}|{min_palabras}|{random_state}"
         hasher.update(firma.encode("utf-8"))
+        hasher.update(np.array([len(str(t).split()) >= min_palabras for t in textos_unlabeled], dtype=bool).tobytes())
         hasher.update(np.ascontiguousarray(X_seed).tobytes())
         hasher.update(np.ascontiguousarray(X_unlabeled).tobytes())
         hasher.update("\x1f".join(map(str, y_seed)).encode("utf-8"))
@@ -35,8 +38,10 @@ def cascading_self_training(
         ruta_cache = os.path.join(cache_dir, f"reetiquetado_{hash_id}.npz")
         if os.path.exists(ruta_cache):
             print(f"\nCargando re-etiquetado desde caché: {ruta_cache}")
-            data = np.load(ruta_cache, allow_pickle=True)
-            return data["X_clean"], data["y_clean"], data["X_full"], data["y_full"]
+            with np.load(ruta_cache, allow_pickle=True) as data:
+                resultado = (data["X_clean"], data["y_clean"], data["X_full"], data["y_full"])
+                historial = data["historial"].tolist()
+            return (*resultado, historial) if devolver_historial else resultado
     n_clases_seed = len(np.unique(y_seed))
     X_current_train = X_seed
     y_current_train = y_seed
@@ -101,6 +106,11 @@ def cascading_self_training(
                 mask_confianza[np.concatenate(indices_elegidos)] = True
 
             nuevos_etiquetados = int(mask_confianza.sum())
+            historial.append(dict(umbral=umbral, iteracion=iteracion_interna,
+                                  nuevos=nuevos_etiquetados,
+                                  pendientes=int(X_unl.shape[0] - nuevos_etiquetados),
+                                  confianza_media=float(max_probs[mask_confianza].mean()) if nuevos_etiquetados else None,
+                                  cambios=int(np.sum(preds[mask_confianza] != y_unl_orig[mask_confianza]))))
             if nuevos_etiquetados == 0:
                 if iteracion_interna == 1:
                     print(f"  > Confianza máxima actual: {max_probs.max():.4f}. Ninguno supera {umbral}.")
@@ -156,7 +166,8 @@ def cascading_self_training(
     print("=" * 50)
 
     if ruta_cache is not None:
-        np.savez(ruta_cache, X_clean=X_clean, y_clean=y_clean, X_full=X_full, y_full=y_full)
+        np.savez(ruta_cache, X_clean=X_clean, y_clean=y_clean, X_full=X_full, y_full=y_full, historial=np.array(historial, dtype=object))
         print(f"Re-etiquetado guardado en caché: {ruta_cache}")
 
-    return X_clean, y_clean, X_full, y_full
+    resultado = (X_clean, y_clean, X_full, y_full)
+    return (*resultado, historial) if devolver_historial else resultado

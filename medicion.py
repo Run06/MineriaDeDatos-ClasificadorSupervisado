@@ -60,3 +60,11 @@ def imprimir_resumen(t_total):
     if pico_so is not None:
         print(f"Pico de RAM (Windows, peak_wset): {pico_so / 1024 ** 2:.0f} MB")
     print("=" * 78)
+
+def exportar_mediciones(ruta):
+    """Exporta las fases medidas (RSS del proceso, no VRAM ni RAM del sistema)."""
+    import csv
+    with open(ruta, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['fase', 'segundos', 'ram_inicio_mib', 'ram_fin_mib', 'ram_pico_mib'])
+        w.writerows(RESUMEN)
