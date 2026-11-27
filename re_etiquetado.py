@@ -17,7 +17,13 @@ def cascading_self_training(
     cache_dir="cache",
 ):
     """
-    Ejecuta un bucle de pseudo-etiquetado en cascada con balanceo relativo y filtro de longitud.
+    - Precondiciones: X_seed e y_seed no estan vacios y tienen igual longitud; X_unlabeled y y_unlabeled_orig tienen igual longitud.
+    - Entradas: X_seed (np.ndarray), y_seed (array de etiquetas), X_unlabeled (np.ndarray),
+      y_unlabeled_orig (array de etiquetas originales), textos_unlabeled (iterable de textos),
+      umbrales (tupla de floats), max_iter_interna (int), factor_balanceo (int o None),
+      min_palabras (int), random_state (int) y cache_dir (str o None).
+    - Salidas: tupla (X_clean, y_clean, X_full, y_full) con los conjuntos limpio (semillas + pseudo-etiquetados) y completo.
+    - Postcondiciones: Devuelve (y guarda en cache si aplica) las matrices y etiquetas resultantes del autoentrenamiento en cascada.
     """
     # --- CACHÉ ---
     ruta_cache = None

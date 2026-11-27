@@ -4,8 +4,11 @@ import numpy as np
 
 def predecir_por_usuario(scores_mensajes, clases,df_mensajes,col_label,max_mensajes=None):
     """
-    Recorre hasta `max_mensajes` de cada usuario y aplica Max-Pooling sobre los scores
-    del clasificador para no diluir los mensajes críticos entre mensajes neutros.
+    - Precondiciones: len(scores_mensajes) == len(df_mensajes) y df_mensajes contiene 'user_id' y col_label.
+    - Entradas: scores_mensajes (np.ndarray 2D), clases (array de etiquetas), df_mensajes (DataFrame),
+      col_label (str) y max_mensajes (int o None).
+    - Salidas: tupla (y_true_users, y_pred_users, media_mensajes) con etiquetas reales, predichas y media de mensajes leidos.
+    - Postcondiciones: Aplica max-pooling por usuario sobre hasta max_mensajes y devuelve una prediccion por usuario.
     """
     df_eval = df_mensajes[["user_id", col_label]].copy()
     df_eval["idx_fila"] = np.arange(len(df_eval))
@@ -32,6 +35,13 @@ def predecir_por_usuario(scores_mensajes, clases,df_mensajes,col_label,max_mensa
     return y_true_users, y_pred_users, float(np.mean(mensajes_leidos))
 
 def entrenar_y_evaluar(titulo, X_tr, y_tr, X_dev_vec, dev_msgs, X_test_vec, test_msgs, col_label,ventanas_k=(1,3,5,10,None)):
+    """
+    - Precondiciones: X_tr e y_tr no estan vacios; las dimensiones de X_dev_vec y X_test_vec coinciden con X_tr.
+    - Entradas: titulo (str), X_tr (np.ndarray), y_tr (array), X_dev_vec (np.ndarray),
+      dev_msgs (DataFrame), X_test_vec (np.ndarray), test_msgs (DataFrame), col_label (str) y ventanas_k (tupla).
+    - Salidas: Ninguna.
+    - Postcondiciones: Entrena un SVM RBF balanceado, evalua distintas ventanas k en Dev y Test e imprime el reporte final.
+    """
     print(f"MODELO: {titulo} (Train: {len(y_tr)} mensajes)")
     svc_model = SVC(
         kernel="rbf",

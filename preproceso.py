@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from nltk import SnowballStemmer, word_tokenize
 from sklearn.feature_extraction.text import TfidfVectorizer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 MODELO_EMBEDDINGS = "paraphrase-multilingual-MiniLM-L12-v2"
 CHUNK_PALABRAS = 80   # ~100-110 tokens, por debajo del límite de 128
@@ -25,6 +26,12 @@ _MODELOS_CACHE = {}
 
 
 def _obtener_modelo(nombre_modelo):
+    """
+    - Precondiciones: nombre_modelo es un identificador valido de SentenceTransformer y DEVICE esta definido.
+    - Entradas: nombre_modelo (str con el nombre del modelo de embeddings).
+    - Salidas: SentenceTransformer cargado en el dispositivo configurado.
+    - Postcondiciones: Cachea y devuelve la instancia del modelo lista para codificar textos.
+    """
     if nombre_modelo not in _MODELOS_CACHE:
         from sentence_transformers import SentenceTransformer
 
@@ -34,7 +41,17 @@ def _obtener_modelo(nombre_modelo):
 
 
 def dividir_mensajes(df, col_post="Post"):
-    """Expande listas de mensajes en filas individuales, conservando el ID del usuario."""
+    """
+    - Entradas:
+        df: DataFrame con una fila por usuario y una lista de mensajes en `col_post`.
+        col_post: str con el nombre de la columna que contiene los mensajes.
+    - Salidas:
+        DataFrame expandido con una fila por mensaje no vacío y columna `user_id`.
+    - Precondición:
+        `col_post` existe en `df`.
+    - Postcondición:
+        Conserva el identificador original del usuario en `user_id` y elimina mensajes vacíos.
+    """
     def parsear(crudo):
         try:
             lista = ast.literal_eval(crudo)
@@ -46,7 +63,7 @@ def dividir_mensajes(df, col_post="Post"):
             return _RE_SPLIT_LISTA.split(s)
 
     out = df.copy()
-    out["user_id"] = out.index
+    out["user_id"] = out["User"] if "User" in out.columns else out.index
     out[col_post] = out[col_post].apply(parsear)
     out = out.explode(col_post, ignore_index=True).dropna(subset=[col_post])
     out[col_post] = out[col_post].astype(str).str.strip()
@@ -54,26 +71,25 @@ def dividir_mensajes(df, col_post="Post"):
 
 
 def clean_text(text):
+    """
+    - Precondiciones: text es convertible a cadena.
+    - Entradas: text (texto de entrada en bruto).
+    - Salidas: str con el texto en minusculas, sin URLs ni caracteres no alfabeticos y con stemming en ingles.
+    - Postcondiciones: Devuelve una cadena limpia con tokens stemizados conservando palabras funcionales.
+    """
     """Limpia ruido y aplica stemming conservando stop words (pronombres y conectores)."""
     text = _RE_URL.sub("", str(text).lower())
     limpio = _RE_ESPACIOS.sub(" ", _RE_NO_LETRAS.sub("", text)).strip()
     tokens = word_tokenize(limpio, language="english")
     return " ".join(_STEMMER.stem(w) for w in tokens)
 
-
-def tfidf(X_train, X_dev, X_test):
-    """Vectoriza las particiones usando TF-IDF sobre texto limpio."""
-    vectorizer = TfidfVectorizer(
-        max_features=8000, ngram_range=(1, 2), min_df=5, max_df=0.85, stop_words=None
-    )
-    X_train_vec = vectorizer.fit_transform(X_train.apply(clean_text))
-    X_dev_vec = vectorizer.transform(X_dev.apply(clean_text))
-    X_test_vec = vectorizer.transform(X_test.apply(clean_text))
-    return X_train_vec, X_dev_vec, X_test_vec
-
-
 def trocear(texto, chunk_palabras, max_chunks):
-    """Divide un texto en trozos de `chunk_palabras` palabras (muestreo uniforme si supera `max_chunks`)."""
+    """
+    - Precondiciones: chunk_palabras > 0 y max_chunks es None o entero positivo.
+    - Entradas: texto (str), chunk_palabras (int) y max_chunks (int o None).
+    - Salidas: list[str] con los fragmentos de texto resultantes.
+    - Postcondiciones: Devuelve al menos un fragmento y limita a max_chunks mediante muestreo uniforme si se excede.
+    """
     palabras = texto.split()
     if not palabras:
         return [""]
@@ -87,9 +103,14 @@ def trocear(texto, chunk_palabras, max_chunks):
     return chunks
 
 
-def _vectorizar_por_trozos(
-    textos, firma, prefijo, cache_dir, chunk_palabras, max_chunks, codificar, normalizar=True
-):
+def _vectorizar_por_trozos(textos, firma, prefijo, cache_dir, chunk_palabras, max_chunks, codificar, normalizar=True):
+    """
+    - Precondiciones: textos es iterable, chunk_palabras > 0 y codificar es invocable sobre una lista de cadenas.
+    - Entradas: textos (iterable de str), firma (str), prefijo (str), cache_dir (str),
+      chunk_palabras (int), max_chunks (int), codificar (callable) y normalizar (bool).
+    - Salidas: np.ndarray 2D con el vector agregado por cada texto de entrada.
+    - Postcondiciones: Recupera o calcula y guarda en cache la matriz de vectores por mensaje (normalizada si normalizar=True).
+    """
     hash_datos = hashlib.md5((firma + "\x1f".join(textos)).encode("utf-8")).hexdigest()[:12]
 
     os.makedirs(cache_dir, exist_ok=True)
@@ -124,7 +145,19 @@ def _vectorizar_por_trozos(
 def vectorizar_embeddings(
     text_cols, cache_dir="cache", chunk_palabras=CHUNK_PALABRAS, max_chunks=MAX_CHUNKS
 ):
-    """Genera (o carga de caché) embeddings L2-normalizados por mensaje."""
+    """
+    Entradas:
+        text_cols: secuencia/Series de textos de longitud N.
+        cache_dir: str con el directorio de caché.
+        chunk_palabras: int máximo de palabras por fragmento.
+        max_chunks: int máximo de fragmentos por mensaje.
+    Salidas:
+        np.ndarray de forma (N, D_emb) con embeddings L2-normalizados por mensaje.
+    Precondición:
+        `text_cols` es iterable y `chunk_palabras > 0`.
+    Postcondición:
+        Devuelve (y guarda en caché) una matriz de embeddings normalizados alineada con `text_cols`.
+    """
     textos = [str(t) for t in text_cols]
     firma = f"{MODELO_EMBEDDINGS}|msg|{chunk_palabras}|{max_chunks}||"
 
@@ -138,3 +171,68 @@ def vectorizar_embeddings(
     return _vectorizar_por_trozos(
         textos, firma, "vectores", cache_dir, chunk_palabras, max_chunks, codificar, normalizar=True
     )
+
+
+def vectorizar_vader(text_cols, cache_dir="cache"):
+    """
+    Entradas:
+        text_cols: secuencia/Series de textos originales (sin stemming ni borrado de puntuación), longitud N.
+        cache_dir: str con el directorio donde guardar/leer caché `.npy` (o None para no cachear).
+    Salidas:
+        np.ndarray de forma (N, 4) y tipo float32 con [neg, neu, pos, compound] por mensaje.
+    Precondición:
+        `text_cols` es iterable y `vaderSentiment` está instalado.
+    Postcondición:
+        Devuelve una matriz 2D `(len(text_cols), 4)` en `float32` alineada fila a fila con `text_cols`.
+    """
+    textos = [str(t) for t in text_cols]
+    ruta_cache = None
+
+    if cache_dir is not None:
+        hash_datos = hashlib.md5(("vader_v1|" + "\x1f".join(textos)).encode("utf-8")).hexdigest()[:12]
+        os.makedirs(cache_dir, exist_ok=True)
+        ruta_cache = os.path.join(cache_dir, f"vader_{hash_datos}.npy")
+        if os.path.exists(ruta_cache):
+            print(f"Cargando vectores VADER desde caché: {ruta_cache}")
+            return np.load(ruta_cache)
+
+    analizador = SentimentIntensityAnalyzer()
+    filas = []
+    for t in textos:
+        s = analizador.polarity_scores(t)
+        filas.append([s["neg"], s["neu"], s["pos"], s["compound"]])
+
+    X_vader = np.asarray(filas, dtype=np.float32)
+    if ruta_cache is not None:
+        np.save(ruta_cache, X_vader)
+        print(f"Vectores VADER guardados en {ruta_cache} con forma {X_vader.shape}")
+    return X_vader
+
+
+def vectorizar_embeddings_y_vader(
+    text_cols, cache_dir="cache", chunk_palabras=CHUNK_PALABRAS, max_chunks=MAX_CHUNKS
+):
+    """
+    Entradas:
+        text_cols: secuencia/Series de textos originales de longitud N.
+        cache_dir: str con el directorio de caché.
+        chunk_palabras: int máximo de palabras por trozo para embeddings.
+        max_chunks: int máximo de trozos por mensaje para embeddings.
+    Salidas:
+        Tupla `(X_emb, X_vader, X_concat)` donde:
+            - X_emb: np.ndarray (N, D_emb)
+            - X_vader: np.ndarray (N, 4)
+            - X_concat: np.ndarray (N, D_emb + 4)
+    Precondición:
+        `text_cols` es iterable; `vectorizar_embeddings` y `vectorizar_vader` operan sobre los mismos textos.
+    Postcondición:
+        Devuelve por separado ambos bloques y su concatenación horizontal lista para clasificadores.
+    """
+    X_emb = np.asarray(
+        vectorizar_embeddings(
+            text_cols, cache_dir=cache_dir, chunk_palabras=chunk_palabras, max_chunks=max_chunks
+        )
+    )
+    X_vader = vectorizar_vader(text_cols, cache_dir=cache_dir)
+    X_concat = np.hstack([X_emb, X_vader])
+    return X_emb, X_vader, X_concat

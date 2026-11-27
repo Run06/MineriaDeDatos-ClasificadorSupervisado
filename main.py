@@ -9,6 +9,12 @@ from eval import entrenar_y_evaluar
 
 
 def parse_args():
+    """
+    - Precondiciones: Ninguna.
+    - Entradas: Argumentos recibidos por linea de comandos (sys.argv).
+    - Salidas: argparse.Namespace con las rutas de entrada y columnas configuradas.
+    - Postcondiciones: Devuelve los parametros listos para ejecutar la clasificacion.
+    """
     parser = argparse.ArgumentParser(
         description="Clasificación supervisada con re-etiquetado en cascada y embeddings"
     )
@@ -20,6 +26,12 @@ def parse_args():
 
 
 def cargar_csv(ruta):
+    """
+    - Precondiciones: ruta es una cadena o Path valida.
+    - Entradas: ruta (str o Path del archivo CSV a cargar).
+    - Salidas: pd.DataFrame con los datos leidos del CSV.
+    - Postcondiciones: Devuelve el DataFrame cargado o finaliza el programa con codigo 1 si no existe.
+    """
     try:
         return pd.read_csv(ruta)
     except FileNotFoundError:
@@ -27,6 +39,12 @@ def cargar_csv(ruta):
         sys.exit(1)
 
 def main():
+    """
+    - Precondiciones: Existen los ficheros CSV indicados en --file y --seed y contienen las columnas target y label.
+    - Entradas: Ninguna directa (lee parametros desde parse_args).
+    - Salidas: Ninguna.
+    - Postcondiciones: Divide por usuario sin fuga, vectoriza, ejecuta el re-etiquetado en cascada y evalua los conjuntos.
+    """
     args = parse_args()
 
     raw_data = cargar_csv(args.file)
