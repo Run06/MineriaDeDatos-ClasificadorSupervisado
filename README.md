@@ -117,9 +117,9 @@ Durante la ejecución:
 El modelo almacena únicamente los pesos entrenables (LoRA + cabeza MIL) junto a su configuración y métricas:
 
 ```python
-from modelo_jerarquico import cargar_checkpoint_mil
+from modelo_jerarquico import cargar_modelo_mil
 
-model, clases, metricas, hiperparametros = cargar_checkpoint_mil(
+model, clases, metricas, hiperparametros = cargar_modelo_mil(
     "output/mejor_modelo.pt", device="cuda"
 )
 print(metricas)
@@ -146,3 +146,16 @@ El archivo registra filas de forma incremental con columnas separadas para disti
 | **Hiperparámetros** | `model_name`, `lora_layers`, `lora_r`, `max_length`, `tau`, `sord_sigma`, `seed_alpha`, `lr_lora`, `lr_head` | Configuración clave para trazabilidad entre experimentos. |
 
 ---
+
+## Ejecución del Baseline (SVC)
+
+El baseline emplea un clasificador `SVC` (kernel RBF, `C=2.0`, `class_weight="balanced"`) entrenado a nivel de mensaje individual sobre embeddings densos congelados (384 dims.) y agregado por usuario mediante *Max-Pooling*, evaluado sobre el mismo **Test congelado** (`n = 75`, `seed = 42`).
+
+### 1. Instalar dependencias
+```bash
+pip install -r requirements.txt
+```
+### 2. Ejecutar Baseline
+```bash
+python main.py --file dataset.csv --seed_file semilla.csv
+```
