@@ -1,0 +1,55 @@
+{
+  "datos": {
+    "file": "tu_dataset.csv",
+    "seed_file": "semilla.csv",
+    "target_col": "Post",
+    "label_col": "Label",
+    "test_size": 0.15,
+    "split_seed": 42
+  },
+  "modelo": {
+    "model_name": "mental/mental-roberta-base",
+    "lora_layers": 12,
+    "lora_r": 8,
+    "lora_alpha": 16.0,
+    "lora_dropout": 0.1,
+    "lora_include_out": true,
+    "grad_checkpointing": false,
+    "hidden_dim": 32,
+    "dropout": 0.4,
+    "multi_sample_dropout_n": 5
+  },
+  "entrenamiento": {
+    "max_length": 384,
+    "max_msgs_train": 32,
+    "msg_dropout": 0.10,
+    "batch_size": 2,
+    "accum_steps": 8,
+    "epochs": 25,
+    "patience": 6,
+    "lr_lora": 0.0002,
+    "lr_head": 0.001,
+    "lora_weight_decay": 0.01,
+    "head_weight_decay": 0.02,
+    "warmup_ratio": 0.10,
+    "tau": 0.75,
+    "sord_sigma": 0.38,
+    "seed_alpha": 0.20,
+    "seed_alpha_decay": 0.75,
+    "sord_seed_sigma": 0.40,
+    "seed_batch_size": 16,
+    "early_stop_auc_weight": 0.5,
+    "use_top2_soup": true
+  },
+  "validacion": {
+    "n_folds": 5,
+    "n_repeats": 1,
+    "seed": 42,
+    "ventanas_k": [1, 3, 5, 10, 15, null]
+  },
+  "salidas": {
+    "metrics_csv": "output/resultados_modelos.csv",
+    "best_model_path": "output/mejor_modelo.pt",
+    "solo_guardar_si_supera_disco": true
+  }
+}

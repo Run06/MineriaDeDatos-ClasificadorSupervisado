@@ -1,6 +1,7 @@
 from contextlib import nullcontext
 from itertools import cycle
 import math
+import os
 import random
 import numpy as np
 import torch
@@ -36,8 +37,8 @@ def calcular_metricas_graded(y_true, y_pred):
     """
     Calcula Graded Precision, Graded Recall y Graded F1 sobre etiquetas en orden clínico (0..4).
     - TP: aciertos exactos (y_pred == y_true)
-    - FP_ord: suma de distancias en sobreestimaciones (y_pred mayor que y_true)
-    - FN_ord: suma de distancias en subestimaciones (y_pred menor que y_true)
+    - FP_ord: suma de distancias en sobreestimaciones (y_pred > y_true)
+    - FN_ord: suma de distancias en subestimaciones (y_pred < y_true)
     """
     y_true = np.asarray(y_true, dtype=np.int64)
     y_pred = np.asarray(y_pred, dtype=np.int64)
@@ -52,7 +53,7 @@ def calcular_metricas_graded(y_true, y_pred):
     return {"graded_p": gp, "graded_r": gr, "graded_f1": gf1}
 
 
-def crear_targets_sord(num_classes, sigma=0.45, device="cpu"):
+def crear_targets_sord(num_classes, sigma=0.38, device="cpu"):
     """Soft Ordinal Targets (SORD): reparte masa suave solo a clases clínicas contiguas."""
     idx = torch.arange(num_classes, dtype=torch.float32, device=device)
     dist_sq = (idx.unsqueeze(1) - idx.unsqueeze(0)) ** 2
@@ -99,7 +100,7 @@ class MessageDataset(Dataset):
 class CollateMessages:
     """Tokeniza un mini-lote de mensajes individuales."""
 
-    def __init__(self, tokenizer, max_length=256):
+    def __init__(self, tokenizer, max_length=384):
         self.tokenizer = tokenizer
         self.max_length = max_length
 
@@ -135,7 +136,6 @@ class UserTextDataset(Dataset):
     def __getitem__(self, idx):
         mensajes = list(self.secuencias_texto[idx])
 
-        # Message Dropout leve solo en historiales largos para regularizar sin borrar posts únicos
         if self.training and self.msg_dropout > 0 and len(mensajes) >= 8:
             filtrados = [m for m in mensajes if random.random() >= self.msg_dropout]
             if len(filtrados) >= 4:
@@ -154,7 +154,7 @@ class UserTextDataset(Dataset):
 class CollateUserTexts:
     """Aplana los mensajes de los usuarios del batch y los tokeniza de golpe."""
 
-    def __init__(self, tokenizer, max_length=256):
+    def __init__(self, tokenizer, max_length=384):
         self.tokenizer = tokenizer
         self.max_length = max_length
 
@@ -176,27 +176,32 @@ class CollateUserTexts:
 
 class HierarchicalMentalRoBERTaMIL(nn.Module):
     """
-    MentalRoBERTa con LoRA (últimas capas) + Token Attention Pooling
-    + Proyección + BiLSTM residual + Clasificador a nivel de mensaje (compartido con semillas)
-    + Agregación MIL (LogSumExp por clase + Media de logits).
+    MentalRoBERTa con LoRA + Token Attention Pooling + BiLSTM residual
+    + Clasificador por mensaje + Agregación MIL (Softmax-Weighted Pooling + Media).
     """
 
     def __init__(
         self,
         model_name="mental/mental-roberta-base",
-        lora_layers=6,
+        lora_layers=12,
         lora_r=8,
         lora_alpha=16.0,
         lora_dropout=0.1,
-        proj_dim=64,
+        lora_include_out=True,
+        grad_checkpointing=False,
         hidden_dim=32,
         num_classes=5,
         dropout=0.4,
+        multi_sample_dropout_n=5,
     ):
         super().__init__()
         self.num_classes = num_classes
+        self.multi_sample_dropout_n = max(1, int(multi_sample_dropout_n))
         self.encoder = AutoModel.from_pretrained(model_name)
-        self._aplicar_lora(lora_layers, lora_r, lora_alpha, lora_dropout)
+        self._aplicar_lora(lora_layers, lora_r, lora_alpha, lora_dropout, lora_include_out)
+
+        if grad_checkpointing and lora_layers > 0:
+            self._activar_checkpointing()
 
         emb_dim = self.encoder.config.hidden_size
 
@@ -205,7 +210,6 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         nn.init.zeros_(self.token_attn.weight)
         nn.init.zeros_(self.token_attn.bias)
 
-        # proj_dim == hidden_dim * 2 para conexión residual limpia con la BiLSTM
         seq_dim = hidden_dim * 2
         self.proj = nn.Sequential(
             nn.Linear(emb_dim, seq_dim),
@@ -223,13 +227,13 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         self.seq_norm = nn.LayerNorm(seq_dim)
         self.head_dropout = nn.Dropout(dropout)
 
-        # Clasificador a nivel de mensaje (compartido entre secuencias de usuario y semillas)
+        # Clasificador a nivel de mensaje (compartido con semillas Multi-Task)
         self.msg_classifier = nn.Linear(seq_dim, num_classes)
 
-        # Temperatura aprendible por clase para LogSumExp MIL (beta inicial ~3.58)
+        # Temperatura aprendible por clase para MIL Softmax-Weighted Pooling
         self.raw_beta = nn.Parameter(torch.full((1, 1, num_classes), 2.5))
 
-        # Fusión ligera (55 params): combina evidencia pico (LogSumExp) y tono medio (Mean)
+        # Fusión ligera: combina evidencia pico (MIL) y tono medio (Mean)
         self.user_combiner = nn.Linear(num_classes * 2, num_classes)
         with torch.no_grad():
             self.user_combiner.weight.zero_()
@@ -238,7 +242,26 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
             self.user_combiner.weight[:, :num_classes] = 0.7 * eye
             self.user_combiner.weight[:, num_classes:] = 0.3 * eye
 
-    def _aplicar_lora(self, lora_layers, r, alpha, dropout):
+    def _activar_checkpointing(self):
+        if hasattr(self.encoder.config, "use_cache"):
+            self.encoder.config.use_cache = False
+        if hasattr(self.encoder, "activation_checkpointing_enable"):
+            try:
+                self.encoder.activation_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                self.encoder.activation_checkpointing_enable()
+        else:
+            try:
+                self.encoder.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                self.encoder.gradient_checkpointing_enable()
+        self.encoder.enable_input_require_grads()
+
+    def _aplicar_lora(self, lora_layers, r, alpha, dropout, include_out=True):
         for p in self.encoder.parameters():
             p.requires_grad = False
 
@@ -250,6 +273,19 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
                 capa.attention.self.value = LoRALinear(
                     capa.attention.self.value, r=r, alpha=alpha, dropout=dropout
                 )
+                if include_out:
+                    capa.attention.output.dense = LoRALinear(
+                        capa.attention.output.dense, r=r, alpha=alpha, dropout=dropout
+                    )
+
+    def trainable_state_dict(self):
+        """Devuelve solo los pesos entrenables (~2 MB) en CPU."""
+        trainable_keys = {n for n, p in self.named_parameters() if p.requires_grad}
+        return {
+            k: v.detach().cpu().clone()
+            for k, v in self.state_dict().items()
+            if k in trainable_keys
+        }
 
     def encode_messages(self, input_ids, attention_mask, use_bf16=True):
         """Vectoriza mensajes con LoRA-MentalRoBERTa y atención sobre tokens reales."""
@@ -270,22 +306,25 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
 
     def _clasificar_representaciones_msg(self, h):
         """Aplica el clasificador por mensaje con Multi-Sample Dropout en entrenamiento."""
-        if self.training:
+        if self.training and self.multi_sample_dropout_n > 1:
             return torch.stack(
-                [self.msg_classifier(self.head_dropout(h)) for _ in range(5)], dim=0
+                [self.msg_classifier(self.head_dropout(h)) for _ in range(self.multi_sample_dropout_n)],
+                dim=0,
             ).mean(dim=0)
+        if self.training:
+            return self.msg_classifier(self.head_dropout(h))
         return self.msg_classifier(h)
 
     def forward_messages(self, input_ids, attention_mask, use_bf16=True):
         """Rama Multi-Task a nivel de mensaje individual (para semilla.csv)."""
         msg_embs = self.encode_messages(input_ids, attention_mask, use_bf16=use_bf16)
-        x = self.proj(msg_embs).unsqueeze(1)  # (B, 1, seq_dim)
+        x = self.proj(msg_embs).unsqueeze(1)
         lstm_out, _ = self.bilstm(x)
         h = self.seq_norm(lstm_out + x).squeeze(1)
         return self._clasificar_representaciones_msg(h)
 
     def forward_from_embeddings(self, x_pad, longitudes):
-        """Clasifica secuencias ya vectorizadas mediante MIL LogSumExp + Media."""
+        """Clasifica secuencias ya vectorizadas mediante MIL Softmax-Weighted + Media."""
         x = self.proj(x_pad)
 
         packed = pack_padded_sequence(
@@ -297,7 +336,6 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         )
         h = self.seq_norm(lstm_out + x)
 
-        # Logits de riesgo por cada mensaje individual del usuario: (B, T, 5)
         msg_logits = self._clasificar_representaciones_msg(h)
 
         max_len = x.size(1)
@@ -305,7 +343,7 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         long_f = longitudes.float().clamp(min=1.0).view(-1, 1)
 
         # 1. MIL Softmax-Weighted Pooling por clase (invariante a la longitud del historial)
-        beta = nn.functional.softplus(self.raw_beta) + 1.0  # (1, 1, 5)
+        beta = nn.functional.softplus(self.raw_beta) + 1.0
         scores_mil = (msg_logits * beta).masked_fill(~mask.unsqueeze(-1), -1e9)
         weights_mil = torch.softmax(scores_mil, dim=1)
         mil_peak = (weights_mil * msg_logits).sum(dim=1)
@@ -324,9 +362,39 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         return self.forward_from_embeddings(x_pad, longitudes)
 
 
+def guardar_checkpoint_mil(model, ruta, config_modelo, clases, metricas, hiperparametros=None):
+    """Guarda los pesos entrenables (LoRA + cabeza MIL) junto con configuración y métricas."""
+    directorio = os.path.dirname(ruta)
+    if directorio:
+        os.makedirs(directorio, exist_ok=True)
+    payload = {
+        "trainable_state_dict": model.trainable_state_dict(),
+        "model_config": dict(config_modelo),
+        "clases": list(clases),
+        "metricas": {k: (float(v) if isinstance(v, (np.floating, float)) else v) for k, v in metricas.items()},
+        "hiperparametros": hiperparametros or {},
+    }
+    torch.save(payload, ruta)
+
+
+def cargar_checkpoint_mil(ruta, device="cpu"):
+    """Reconstruye HierarchicalMentalRoBERTaMIL desde un checkpoint ligero guardado."""
+    try:
+        ckpt = torch.load(ruta, map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(ruta, map_location="cpu")
+
+    cfg = dict(ckpt["model_config"])
+    cfg["grad_checkpointing"] = False
+    model = HierarchicalMentalRoBERTaMIL(**cfg).to(device)
+    model.load_state_dict(ckpt["trainable_state_dict"], strict=False)
+    model.eval()
+    return model, ckpt["clases"], ckpt.get("metricas", {}), ckpt.get("hiperparametros", {})
+
+
 @torch.no_grad()
 def extraer_secuencias_con_encoder(
-    model, secuencias_texto, tokenizer, device, max_length=256, msg_batch_size=64, use_bf16=True
+    model, secuencias_texto, tokenizer, device, max_length=384, msg_batch_size=64, use_bf16=True
 ):
     """Vectoriza una sola vez todos los mensajes de Val/Test con el encoder actual."""
     model.eval()
@@ -416,29 +484,39 @@ def entrenar_jerarquico_mil(
     device,
     seed_texts=None,
     seed_labels=None,
-    seed_alpha=0.35,
+    seed_alpha=0.20,
+    seed_alpha_decay=0.75,
+    sord_seed_sigma=0.40,
     seed_batch_size=16,
     model_name="mental/mental-roberta-base",
-    lora_layers=6,
+    lora_layers=12,
     lora_r=8,
     lora_alpha=16.0,
+    lora_dropout=0.1,
+    lora_include_out=True,
+    grad_checkpointing=False,
     hidden_dim=32,
     dropout=0.4,
-    max_length=256,
+    multi_sample_dropout_n=5,
+    max_length=384,
     max_msgs_train=32,
     msg_dropout=0.10,
     batch_size=2,
     accum_steps=8,
-    lr_lora=3e-4,
+    lr_lora=2e-4,
     lr_head=1e-3,
-    weight_decay=2e-2,
-    tau=1.0,
-    sord_sigma=0.45,
+    lora_weight_decay=1e-2,
+    head_weight_decay=2e-2,
+    warmup_ratio=0.10,
+    tau=0.75,
+    sord_sigma=0.38,
+    early_stop_auc_weight=0.5,
+    use_top2_soup=True,
     epochs=25,
     patience=6,
     seed=42,
 ):
-    """Entrena MentalRoBERTa-LoRA + MIL LogSumExp + Multi-Task con semillas limpias."""
+    """Entrena MentalRoBERTa-LoRA + MIL + Multi-Task + Top-2 Checkpoint Soup."""
     fijar_semilla(seed)
     use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
     num_classes = len(clases)
@@ -448,19 +526,23 @@ def entrenar_jerarquico_mil(
         lora_layers=lora_layers,
         lora_r=lora_r,
         lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        lora_include_out=lora_include_out,
+        grad_checkpointing=grad_checkpointing,
         hidden_dim=hidden_dim,
         num_classes=num_classes,
         dropout=dropout,
+        multi_sample_dropout_n=multi_sample_dropout_n,
     ).to(device)
 
     total_p = sum(p.numel() for p in model.parameters())
     train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    trainable_keys = {n for n, p in model.named_parameters() if p.requires_grad}
     usar_semillas = seed_texts is not None and len(seed_texts) > 0 and seed_alpha > 0
+    modulos_str = "Q+V+Out" if lora_include_out else "Q+V"
     print(
         f"Parámetros entrenables: {train_p:,} / {total_p:,} ({100 * train_p / total_p:.2f}%) | "
-        f"LoRA(capas={lora_layers}, r={lora_r}) | Multi-Task semillas="
-        f"{len(seed_texts) if usar_semillas else 0} (alpha={seed_alpha if usar_semillas else 0.0})"
+        f"LoRA(capas={lora_layers}, r={lora_r}, {modulos_str}) | max_len={max_length} | "
+        f"grad_ckpt={grad_checkpointing} | sord={sord_sigma} | semillas={len(seed_texts) if usar_semillas else 0}"
     )
 
     train_loader = DataLoader(
@@ -476,13 +558,11 @@ def entrenar_jerarquico_mil(
         collate_fn=CollateUserTexts(tokenizer, max_length=max_length),
     )
 
-    # Balanced Softmax + SORD para usuarios
     conteos = np.bincount(train_labels, minlength=num_classes).astype(np.float32)
     priors = conteos / conteos.sum()
     log_priors = torch.tensor(np.log(np.clip(priors, 1e-12, 1.0)), dtype=torch.float32, device=device)
     sord_user = crear_targets_sord(num_classes, sigma=sord_sigma, device=device)
 
-    # Loader auxiliar de mensajes semilla para entrenamiento Multi-Task
     seed_iter = None
     log_seed_priors = None
     sord_seed = None
@@ -499,7 +579,7 @@ def entrenar_jerarquico_mil(
         log_seed_priors = torch.tensor(
             np.log(np.clip(priors_s, 1e-12, 1.0)), dtype=torch.float32, device=device
         )
-        sord_seed = crear_targets_sord(num_classes, sigma=0.40, device=device)
+        sord_seed = crear_targets_sord(num_classes, sigma=sord_seed_sigma, device=device)
 
     lora_params = [
         p for n, p in model.named_parameters() if n.startswith("encoder.") and p.requires_grad
@@ -509,24 +589,21 @@ def entrenar_jerarquico_mil(
     ]
     param_groups = []
     if lora_params:
-        param_groups.append({"params": lora_params, "lr": lr_lora, "weight_decay": 0.01})
-    param_groups.append({"params": head_params, "lr": lr_head, "weight_decay": weight_decay})
+        param_groups.append({"params": lora_params, "lr": lr_lora, "weight_decay": lora_weight_decay})
+    param_groups.append({"params": head_params, "lr": lr_head, "weight_decay": head_weight_decay})
     optimizer = torch.optim.AdamW(param_groups)
 
     steps_por_epoca = math.ceil(len(train_loader) / accum_steps)
     total_steps = steps_por_epoca * epochs
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=max(1, int(0.1 * total_steps)),
+        num_warmup_steps=max(1, int(warmup_ratio * total_steps)),
         num_training_steps=total_steps,
     )
 
     mejor_score = -1.0
-    mejor_auc_real = 0.0
-    mejor_f1_val = 0.0
-    mejor_gf1_val = 0.0
-    mejor_estado = None
     sin_mejora = 0
+    top_checkpoints = []
 
     for epoca in range(1, epochs + 1):
         model.train()
@@ -534,7 +611,7 @@ def entrenar_jerarquico_mil(
         loss_user_acum = 0.0
         loss_seed_acum = 0.0
         n_seed_steps = 0
-        alpha_ep = seed_alpha * (1.0 - 0.75 * (epoca - 1) / max(1, epochs - 1))
+        alpha_ep = seed_alpha * (1.0 - seed_alpha_decay * (epoca - 1) / max(1, epochs - 1))
 
         for step, (input_ids, attention_mask, longitudes, y) in enumerate(train_loader, start=1):
             input_ids = input_ids.to(device)
@@ -549,7 +626,6 @@ def entrenar_jerarquico_mil(
             loss_user_acum += loss_u.item() * accum_steps
 
             if step % accum_steps == 0 or step == len(train_loader):
-                # Paso auxiliar Multi-Task con 1 mini-lote de semillas limpias por actualización
                 if usar_semillas:
                     s_ids, s_mask, s_y = next(seed_iter)
                     s_ids = s_ids.to(device)
@@ -574,8 +650,9 @@ def entrenar_jerarquico_mil(
             model, val_texts, tokenizer, device, max_length=max_length, use_bf16=use_bf16
         )
         res_val = evaluar_secuencias_emb(model, val_embs, val_labels, device, max_mensajes=None)
+        w_auc = early_stop_auc_weight
         score_actual = (
-            0.5 * res_val["auc"] + 0.5 * res_val["macro_f1"]
+            w_auc * res_val["auc"] + (1.0 - w_auc) * res_val["macro_f1"]
             if not np.isnan(res_val["auc"])
             else res_val["macro_f1"]
         )
@@ -589,16 +666,23 @@ def entrenar_jerarquico_mil(
             f"| Val GF1: {res_val['graded_f1']:.4f}"
         )
 
+        max_keep = 2 if use_top2_soup else 1
+        if len(top_checkpoints) < max_keep or score_actual > top_checkpoints[-1]["score"]:
+            top_checkpoints.append(
+                {
+                    "score": score_actual,
+                    "auc": res_val["auc"],
+                    "f1": res_val["macro_f1"],
+                    "gf1": res_val["graded_f1"],
+                    "epoca": epoca,
+                    "state": model.trainable_state_dict(),
+                }
+            )
+            top_checkpoints.sort(key=lambda x: x["score"], reverse=True)
+            top_checkpoints = top_checkpoints[:max_keep]
+
         if score_actual > mejor_score:
             mejor_score = score_actual
-            mejor_auc_real = res_val["auc"]
-            mejor_f1_val = res_val["macro_f1"]
-            mejor_gf1_val = res_val["graded_f1"]
-            mejor_estado = {
-                k: v.detach().cpu().clone()
-                for k, v in model.state_dict().items()
-                if k in trainable_keys
-            }
             sin_mejora = 0
         else:
             sin_mejora += 1
@@ -606,8 +690,46 @@ def entrenar_jerarquico_mil(
                 print(f"    Early stopping en época {epoca} (sin mejora en {patience} épocas).")
                 break
 
-    if mejor_estado is not None:
-        model.load_state_dict(mejor_estado, strict=False)
-        del mejor_estado
+    best_cp = top_checkpoints[0]
+    mejor_auc_real = best_cp["auc"]
+    mejor_f1_val = best_cp["f1"]
+    mejor_gf1_val = best_cp["gf1"]
+    mejor_epoca = str(best_cp["epoca"])
 
-    return model, mejor_f1_val, mejor_gf1_val, mejor_auc_real
+    if use_top2_soup and len(top_checkpoints) == 2:
+        cp1, cp2 = top_checkpoints[0], top_checkpoints[1]
+        soup_state = {k: 0.5 * (cp1["state"][k] + cp2["state"][k]) for k in cp1["state"]}
+        model.load_state_dict(soup_state, strict=False)
+        val_embs_soup = extraer_secuencias_con_encoder(
+            model, val_texts, tokenizer, device, max_length=max_length, use_bf16=use_bf16
+        )
+        res_soup = evaluar_secuencias_emb(
+            model, val_embs_soup, val_labels, device, max_mensajes=None
+        )
+        w_auc = early_stop_auc_weight
+        score_soup = (
+            w_auc * res_soup["auc"] + (1.0 - w_auc) * res_soup["macro_f1"]
+            if not np.isnan(res_soup["auc"])
+            else res_soup["macro_f1"]
+        )
+
+        if score_soup >= cp1["score"]:
+            mejor_auc_real = res_soup["auc"]
+            mejor_f1_val = res_soup["macro_f1"]
+            mejor_gf1_val = res_soup["graded_f1"]
+            mejor_epoca = f"{cp1['epoca']}+{cp2['epoca']}"
+            print(
+                f"    [Top-2 Soup] Épocas {mejor_epoca} aceptado | "
+                f"Val AUC: {mejor_auc_real:.4f} | Val F1: {mejor_f1_val:.4f} | Val GF1: {mejor_gf1_val:.4f}"
+            )
+        else:
+            model.load_state_dict(cp1["state"], strict=False)
+            print(
+                f"    [Top-2 Soup] Se conserva mejor época individual ({cp1['epoca']}) | "
+                f"Val AUC: {mejor_auc_real:.4f} | Val F1: {mejor_f1_val:.4f}"
+            )
+    else:
+        model.load_state_dict(best_cp["state"], strict=False)
+
+    del top_checkpoints
+    return model, mejor_f1_val, mejor_gf1_val, mejor_auc_real, mejor_epoca
