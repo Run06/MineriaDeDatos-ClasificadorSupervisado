@@ -8,13 +8,13 @@ Proyecto grupal para la asignatura de Minería de Datos del grado en Ingeniería
 - keneth: experimentación de Keneth.
 
 # Ibai
-## Clasificación Jerárquica de Riesgo Suicida (C-SSRS) con MentalRoBERTa-LoRA y BiLSTM-MIL
+## Clasificación Jerárquica de Riesgo Suicida (C-SSRS) con MentalRoBERTa y BiLSTM-MIL
 
 Sistema de aprendizaje profundo jerárquico para estimar el nivel de riesgo suicida a nivel de usuario sobre historiales de publicaciones en Reddit según la escala clínica **C-SSRS** de 5 niveles ordenados:
 
 `Supportive (0)` → `Indicator (1)` → `Ideation (2)` → `Behavior (3)` → `Attempt (4)`
 
-El proyecto combina adaptación eficiente de parámetros (**LoRA** en las 12 capas de `mental/mental-roberta-base`, solo el **0,41 %** de los pesos entrenables), modelado secuencial bidireccional (**BiLSTM** residual), agregación **Multiple Instance Learning (MIL)** invariante a la longitud del historial para evitar la dilución de mensajes críticos de `Attempt`, aprendizaje **Multi-Task** con mensajes semilla limpios (`semilla.csv`) y pérdida **Balanced Softmax + Soft Ordinal Targets (SORD)** para abordar simultáneamente el desbalanceo severo y la naturaleza ordinal de la tarea.
+El proyecto combina adaptación eficiente de parámetros (**LoRA** en las 12 capas de `mental/mental-roberta-base`, solo el **0,41 %** de los pesos entrenables), modelado secuencial bidireccional (**BiLSTM** residual), agregación **Multiple Instance Learning (MIL)** invariante a la longitud del historial para evitar la dilución de mensajes críticos de `Attempt`, aprendizaje **Multi-Task** con mensajes semilla limpios (`semilla.csv`) y pérdida **Balanced Softmax + Soft Ordinal Targets (SORD)** para abordar simultáneamente el desbalanceo severo y la naturaleza de la tarea.
 
 ---
 
@@ -22,7 +22,7 @@ El proyecto combina adaptación eficiente de parámetros (**LoRA** en las 12 cap
 
 ```text
 .
-├── main.py                  # Orquestación: split estratificado, CV, OOF, Ensemble y registro
+├── main.py                  # split estratificado, CV, OOF, Ensemble y registro
 ├── modelo_jerarquico.py     # Arquitectura MentalRoBERTa-LoRA + Token Attn + BiLSTM-MIL y entrenamiento
 ├── preproceso.py            # Gestión de dispositivo (CUDA/CPU) y expansión cronológica de mensajes
 ├── utilidades.py            # Carga de JSON/CSV, filtrado sin fuga, métricas, tiempos y RAM/VRAM
@@ -45,7 +45,7 @@ Requiere **Python 3.10+** (recomendado entorno con GPU CUDA para el entrenamient
 ```bash
 # 1. Crear y activar entorno virtual (opcional)
 python -m venv .venv
-source .venv/bin/activate  # En Windows: .venv\Scripts\activate
+source .venv/bin/activate
 
 # 2. Instalar dependencias
 pip install -r requirements.txt
@@ -63,7 +63,7 @@ matplotlib>=3.8.0
 seaborn>=0.13.0
 ```
 
-> **Acceso a `mental/mental-roberta-base`:** Este modelo es un repositorio con acceso solicitado (*gated*) en Hugging Face. Si es la primera vez que se descarga en el equipo, autentíquese previamente con `huggingface-cli login` (o `hf auth login`) tras aceptar sus condiciones de uso.
+> **Acceso a `mental/mental-roberta-base`:** Este modelo es un repositorio con acceso solicitado en Hugging Face.
 
 ---
 
@@ -74,8 +74,8 @@ Todos los hiperparámetros y rutas del experimento se centralizan en `parametros
 | Bloque | Parámetros clave | Valor por defecto | Descripción |
 | :--- | :--- | :--- | :--- |
 | **`datos`** | `file`, `seed_file` | CSV usuarios / `"semilla.csv"` | Rutas al dataset principal y a los 200 mensajes semilla. |
-| | `target_col`, `label_col` | `"Post"`, `"Label"` | Nombres de las columnas de texto y etiqueta clínica. |
-| | `test_size`, `split_seed` | `0.15`, `42` | Partición congelada de Test (idéntica al baseline). |
+| | `target_col`, `label_col` | `"Post"`, `"Label"` | Nombres de las columnas de texto y etiqueta. |
+| | `test_size`, `split_seed` | `0.15`, `42` | Partición congelada de Test. |
 | **`modelo`** | `model_name` | `"mental/mental-roberta-base"` | Encoder preentrenado base. |
 | | `lora_layers`, `lora_r`, `lora_alpha`, `lora_include_out` | `12`, `8`, `16.0`, `true` | Adaptación LoRA en atención (`Q`, `V` y proyección de salida). |
 | | `hidden_dim`, `dropout`, `multi_sample_dropout_n` | `32`, `0.4`, `5` | Dimensión de la BiLSTM y regularización en la cabeza clasificadora. |
@@ -96,10 +96,9 @@ Todos los hiperparámetros y rutas del experimento se centralizan en `parametros
 
 ### 1. Entrenamiento y evaluación completa (CV + OOF + Ensemble)
 
-Edite `"file"` en `parametros.json` con la ruta de su CSV de 500 usuarios (o pásela mediante `-f`):
+Editar `"file"` en `parametros.json` con la ruta del CSV (o usar párametro `-f`):
 
 ```bash
-# Ejecución estándar usando parametros.json
 python main.py -p parametros.json
 
 # Sobreescribir dataset o esquema de repeticiones desde consola (ej. 2x5-Fold = 10 modelos)
@@ -117,9 +116,6 @@ Durante la ejecución:
 ```bash
 # Genera las figuras en output/graficas/ con los datos consolidados del estudio
 python graficas.py
-
-# Opcional: actualizar la curva RQ2 leyendo el último Ensemble registrado en el CSV
-python graficas.py --csv output/resultados_modelos.csv
 ```
 
 ### 3. Carga del mejor checkpoint guardado (`output/mejor_modelo.pt`)
@@ -144,7 +140,7 @@ El archivo registra filas de forma incremental con columnas separadas para disti
 | Bloque | Columnas | Descripción |
 | :--- | :--- | :--- |
 | **Identificación** | `timestamp`, `run_id`, `tipo`, `conjunto_eval`, `n_usuarios_eval`, `rep`, `fold`, `epoca_sel`, `ventana` | `tipo` distingue `modelo_fold`, `oof` y `ensemble`. `conjunto_eval` indica explícitamente si las columnas `eval_*` miden `test` (`75` usuarios) o `dev_oof` (`425` usuarios). |
-| **Validación interna** | `dev_fold_auc`, `dev_fold_macro_f1`, `dev_fold_graded_f1` | Rendimiento sobre el fold de validación (`85` usuarios) usado para *early stopping* y selección de época. Quedan vacías en `oof` y `ensemble`. |
+| **Validación interna** | `dev_fold_auc`, `dev_fold_macro_f1`, `dev_fold_graded_f1` | Rendimiento sobre el fold de validación (`85` usuarios) usado para *early stopping* y selección de epoch. Quedan vacías en `oof` y `ensemble`. |
 | **Evaluación principal** | `eval_macro_f1`, `eval_weighted_f1`, `eval_graded_f1`, `eval_graded_p`, `eval_graded_r`, `eval_auc`, `eval_qwk`, `eval_kappa`, `eval_mae_ordinal`, `eval_acc_pm1` | Métricas de clasificación y ordinales calculadas sobre `conjunto_eval`. `eval_acc_pm1` indica la proporción de predicciones exactas o a ±1 nivel clínico. |
 | **F1 por clase** | `eval_f1_Supportive`, `eval_f1_Indicator`, `eval_f1_Ideation`, `eval_f1_Behavior`, `eval_f1_Attempt` | F1-score individual de cada clase clínica en `conjunto_eval` (incluyendo la clase minoritaria `Attempt`). |
 | **Recursos** | `dispositivo`, `tiempo_entrenamiento_seg`, `tiempo_entrenamiento_min`, `ram_actual_mb`, `ram_pico_mb`, `vram_pico_asignada_mb`, `vram_pico_reservada_mb` | Tiempo de entrenamiento y consumo de memoria RAM/VRAM por fold y acumulado/pico global del *run*. |
