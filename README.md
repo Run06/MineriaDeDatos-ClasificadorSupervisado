@@ -111,16 +111,10 @@ Durante la ejecución:
 3. Al finalizar cada fold se anexa su fila a `output/resultados_modelos.csv` y se actualiza `output/mejor_modelo.pt` si mejora el mejor `Test Macro F1` registrado.
 4. Al cierre se calculan y guardan la validación **Out-Of-Fold (425 usuarios)**, las métricas **Media ± DE** por ventana temprana $k$, el **Ensemble en Test** y el resumen computacional (tiempo, RAM y VRAM).
 
-### 2. Generación de figuras para el póster (PDF vectorial y PNG a 300 DPI)
 
-```bash
-# Genera las figuras en output/graficas/ con los datos consolidados del estudio
-python graficas.py
-```
+### 2. Carga del mejor modelo entrenado (`output/mejor_modelo.pt`)
 
-### 3. Carga del mejor checkpoint guardado (`output/mejor_modelo.pt`)
-
-El checkpoint almacena únicamente los pesos entrenables (LoRA + cabeza MIL) junto a su configuración y métricas:
+El modelo almacena únicamente los pesos entrenables (LoRA + cabeza MIL) junto a su configuración y métricas:
 
 ```python
 from modelo_jerarquico import cargar_checkpoint_mil
@@ -130,7 +124,12 @@ model, clases, metricas, hiperparametros = cargar_checkpoint_mil(
 )
 print(metricas)
 ```
+### 3. Generación de figuras para el póster (PDF vectorial y PNG a 300 DPI)
 
+```bash
+# Genera las figuras en output/graficas/ con los datos consolidados
+python graficas.py
+```
 ---
 
 ## Esquema de `output/resultados_modelos.csv`

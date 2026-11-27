@@ -15,7 +15,7 @@ from modelo_jerarquico import (
     entrenar_jerarquico_mil,
     evaluar_secuencias_emb,
     extraer_secuencias_con_encoder,
-    guardar_checkpoint_mil,
+    guardar_modelo_mil,
 )
 from utilidades import (
     anexar_fila_csv,
@@ -34,6 +34,20 @@ from utilidades import (
 
 
 def parse_args():
+    """
+        Define y procesa los argumentos pasados por línea de comandos.
+        Precondición:
+            Los argumentos recibidos en `sys.argv` deben respetar los tipos definidos
+            (`--n_folds` y `--n_repeats`, si se indican, deben ser enteros válidos).
+        Entradas:
+            Ninguna por parámetro (lee directamente `sys.argv`).
+        Salidas:
+            argparse.Namespace: Objeto con los campos `params` (str), `file` (str | None),
+            `seed_file` (str | None), `n_folds` (int | None) y `n_repeats` (int | None).
+        Postcondición:
+            Devuelve el `Namespace` parseado. Si los argumentos son inválidos o se
+            invoca `-h`/`--help`, el proceso finaliza mostrando la ayuda de uso.
+    """
     parser = argparse.ArgumentParser(
         description="MentalRoBERTa-LoRA + MIL + Multi-Task + CV (configurado desde parametros.json)"
     )
@@ -48,6 +62,32 @@ def parse_args():
 
 
 def main():
+    """
+        Orquesta el flujo completo de carga de datos, validación cruzada estratificada,
+        evaluación Out-Of-Fold (OOF), evaluación del Ensemble en Test y guardado de resultados.
+        Precondición:
+            - Debe existir el archivo JSON indicado en `--params` con las secciones
+              `datos`, `modelo`, `entrenamiento`, `validacion` y `salidas`.
+            - Debe existir el CSV de usuarios (`datos.file`) con las columnas `target_col`
+              y `label_col` y suficientes muestras por clase para estratificar el split
+              de Test y los `n_folds`.
+            - Si `seed_alpha > 0` y `datos.seed_file` está definido, dicho CSV debe existir.
+            - Debe haber acceso al tokenizer y pesos preentrenados de `modelo.model_name`.
+        Entradas:
+            Ninguna por parámetro (lee la configuración desde línea de comandos, el JSON
+            de parámetros y los archivos CSV configurados).
+        Salidas:
+            None.
+        Postcondición:
+            - Se entrenan `n_repeats * n_folds` modelos y se libera la memoria GPU/CPU al
+              finalizar cada fold.
+            - Se anexan de forma incremental las filas de tipo `modelo_fold`, `oof` y
+              `ensemble` (por ventana k) en `salidas.metrics_csv`.
+            - Se guarda o sobrescribe `salidas.best_model_path` si algún fold supera el
+              mejor `Test Macro F1` registrado.
+            - Se imprimen por salida estándar los reportes de clasificación, el diagnóstico
+              detallado en Test y el resumen de tiempo y consumo de RAM/VRAM.
+    """
     t_inicio_run = time.perf_counter()
     args = parse_args()
     params = cargar_parametros(args.params)
@@ -147,7 +187,7 @@ def main():
     )
     if mejor_test_f1_guardado >= 0:
         print(
-            f"Checkpoint previo detectado en '{best_model_path}' "
+            f"Modelo previo detectado en '{best_model_path}' "
             f"(Test Macro F1 = {mejor_test_f1_guardado:.4f}). Solo se sobrescribirá si se supera."
         )
 
@@ -313,7 +353,7 @@ def main():
 
                 if res_t_todos["macro_f1"] > mejor_test_f1_guardado:
                     mejor_test_f1_guardado = float(res_t_todos["macro_f1"])
-                    guardar_checkpoint_mil(
+                    guardar_modelo_mil(
                         model=model,
                         ruta=best_model_path,
                         config_modelo=config_modelo_ckpt,

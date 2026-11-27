@@ -87,7 +87,19 @@ PALETA = {
 }
 
 
-def configurar_estilo_poster():
+def configurar_estilo():
+    """
+        Configura los estilos globales de Seaborn y Matplotlib para figuras.
+        Precondición:
+            Las librerías `matplotlib.pyplot` y `seaborn` deben estar importadas correctamente.
+        Entradas:
+            Ninguna.
+        Salidas:
+            None.
+        Postcondición:
+            Modifica el estado global `plt.rcParams` y el tema activo de Seaborn con tipografía
+            legible, resolución de 300 DPI y fuentes TrueType (`fonttype=42`) para exportación PDF.
+    """
     sns.set_theme(style="whitegrid", context="paper")
     plt.rcParams.update(
         {
@@ -113,7 +125,24 @@ def configurar_estilo_poster():
 
 
 def cargar_propuesto_desde_csv(ruta_csv, run_id=None):
-    """Actualiza PROPUESTO_RQ2 desde las filas tipo='ensemble' del último run en el CSV."""
+    """
+    Carga las métricas por ventana del modelo Ensemble desde un CSV de resultados.
+    Precondición:
+        - Debe existir el archivo `ruta_csv` en formato CSV legible por pandas.
+        - El CSV debe contener al menos una fila con `tipo == "ensemble"` y las columnas
+          `run_id`, `ventana` y las métricas de `macro_f1`, `graded_f1` y `auc`
+          (con o sin prefijo `eval_`).
+        - Para el `run_id` seleccionado deben existir todas las ventanas definidas en `VENTANAS`.
+    Entradas:
+        ruta_csv (str): Ruta al archivo CSV de resultados (`output/resultados_modelos.csv`).
+        run_id (str | None): Identificador de ejecución a cargar; si es `None`, selecciona el último.
+    Salidas:
+        dict[str, np.ndarray]: Diccionario con claves `"macro_f1"`, `"graded_f1"` y `"auc"`,
+        cada una asociada a un array NumPy de longitud `len(VENTANAS)` en el orden de `VENTANAS`.
+    Postcondición:
+        Devuelve el diccionario de arrays numéricos e imprime el `run_id` cargado. Si faltan
+        filas del ensemble o alguna ventana, lanza `ValueError`.
+    """
     df = pd.read_csv(ruta_csv)
     df_ens = df[df["tipo"] == "ensemble"].copy()
     if df_ens.empty:
@@ -141,6 +170,21 @@ def cargar_propuesto_desde_csv(ruta_csv, run_id=None):
 
 
 def guardar_figura(fig, ruta_base):
+    """
+        Guarda una figura de Matplotlib en formato vectorial PDF y en PNG a 300 DPI.
+        Precondición:
+            - `fig` debe ser una instancia válida y abierta de `matplotlib.figure.Figure`.
+            - `ruta_base` debe incluir una ruta con directorio válido (sin extensión) y permisos
+              de escritura en disco.
+        Entradas:
+            fig (matplotlib.figure.Figure): Figura a exportar.
+            ruta_base (str): Ruta destino sin extensión (ej. `"output/graficas/rq2_deteccion_temprana"`).
+        Salidas:
+            None.
+        Postcondición:
+            Crea el directorio padre si no existía, genera los archivos `{ruta_base}.pdf` y
+            `{ruta_base}.png` en disco e imprime la confirmación por consola.
+    """
     os.makedirs(os.path.dirname(ruta_base), exist_ok=True)
     fig.savefig(f"{ruta_base}.pdf", bbox_inches="tight", facecolor="white")
     fig.savefig(f"{ruta_base}.png", dpi=300, bbox_inches="tight", facecolor="white")
@@ -150,6 +194,26 @@ def guardar_figura(fig, ruta_base):
 # GRÁFICA 1: CURVA DE DETECCIÓN TEMPRANA RQ2
 
 def generar_grafica_rq2(prop_data, prop_std, base_comp, out_dir):
+    """
+        Genera y guarda la gráfica apilada (2×1) de detección temprana (Macro F1 y AUC Macro)
+        comparando el modelo propuesto frente al baseline.
+        Precondición:
+            - `prop_data` y `base_comp` deben contener las claves `"macro_f1"` y `"auc"` con
+              arrays de longitud igual a `len(VENTANAS)`.
+            - `prop_std` debe contener `"macro_f1_mean"`, `"macro_f1_std"`, `"auc_mean"` y
+              `"auc_std"` con arrays de longitud igual a `len(VENTANAS)`.
+            - `VENTANAS` debe incluir el valor `"10"` y coincidir en longitud con `MSGS_MEDIOS`.
+        Entradas:
+            prop_data (dict[str, np.ndarray]): Métricas del Ensemble propuesto por ventana.
+            prop_std (dict[str, np.ndarray]): Media y desviación estándar de los folds individuales.
+            base_comp (dict[str, np.ndarray]): Métricas del baseline SVC por ventana.
+            out_dir (str): Carpeta destino donde se guardarán las figuras.
+        Salidas:
+            None.
+        Postcondición:
+            Exporta `rq2_deteccion_temprana.pdf` y `rq2_deteccion_temprana.png` en `out_dir`
+            y cierra la figura para liberar memoria.
+    """
     x = np.arange(len(VENTANAS))
     etiquetas_x = [
         f"1 msg\n({MSGS_MEDIOS[0]:.1f})" if v == "1"
@@ -274,10 +338,28 @@ def generar_grafica_rq2(prop_data, prop_std, base_comp, out_dir):
     guardar_figura(fig, os.path.join(out_dir, "rq2_deteccion_temprana"))
     plt.close(fig)
 
-
-# GRÁFICAS 2 Y 3: MATRICES DE CONFUSIÓN CLÍNICAS NORMALIZADAS (0% - 100%)
-
 def _dibujar_heatmap_clinico(ax, cm, clases, titulo, subtitulo, show_ylabel=True, cbar_ax=None):
+    """
+        Dibuja sobre unos ejes dados una matriz de confusión normalizada por filas (recall %)
+        en orden clínico, resaltando la diagonal de aciertos exactos.
+        Precondición:
+            - `cm` debe ser una matriz NumPy 2D cuadrada de enteros no negativos con forma
+              `(len(clases), len(clases))`.
+            - `ax` debe ser un objeto `matplotlib.axes.Axes` válido (y `cbar_ax` también si no es `None`).
+        Entradas:
+            ax (matplotlib.axes.Axes): Ejes donde se dibuja el mapa de calor.
+            cm (np.ndarray): Matriz de confusión en conteos absolutos.
+            clases (list[str]): Etiquetas de clase en orden clínico creciente de riesgo.
+            titulo (str): Título principal del subgráfico.
+            subtitulo (str): Línea(s) de métricas resumen mostradas bajo el título.
+            show_ylabel (bool): Indica si se muestran las etiquetas del eje vertical.
+            cbar_ax (matplotlib.axes.Axes | None): Ejes opcionales para la barra de color compartida.
+        Salidas:
+            None.
+        Postcondición:
+            Modifica `ax` (y `cbar_ax` si se proporciona) dibujando el mapa de calor en escala
+            0%–100%, las anotaciones de porcentaje y conteo absoluto, y los recuadros de la diagonal.
+    """
     totales = cm.sum(axis=1, keepdims=True)
     cm_norm = np.divide(
         cm.astype(float), totales, out=np.zeros_like(cm, dtype=float), where=totales != 0
@@ -347,6 +429,23 @@ def _dibujar_heatmap_clinico(ax, cm, clases, titulo, subtitulo, show_ylabel=True
 
 
 def generar_matriz_individual(cm, clases, resumen, out_dir):
+    """
+        Genera y guarda la figura individual de la matriz de confusión clínica del modelo propuesto.
+        Precondición:
+            - `cm` debe tener dimensiones `(len(clases), len(clases))`.
+            - `resumen` debe contener las claves numéricas `"macro_f1"`, `"graded_f1"`, `"qwk"`
+              y `"acc_pm1"`.
+        Entradas:
+            cm (np.ndarray): Matriz de confusión del modelo propuesto en Test.
+            clases (list[str]): Lista de nombres de clases en orden clínico.
+            resumen (dict[str, float]): Métricas agregadas mostradas en el subtítulo.
+            out_dir (str): Carpeta destino donde se guardará la figura.
+        Salidas:
+            None.
+        Postcondición:
+            Exporta `rq1_matriz_propuesto.pdf` y `rq1_matriz_propuesto.png` en `out_dir`
+            y cierra la figura para liberar memoria.
+    """
     fig = plt.figure(figsize=(6.6, 5.2))
     gs = GridSpec(1, 2, width_ratios=[1.0, 0.055], wspace=0.06, figure=fig)
     ax = fig.add_subplot(gs[0, 0])
@@ -372,6 +471,26 @@ def generar_matriz_individual(cm, clases, resumen, out_dir):
 
 
 def generar_matrices_comparativa(cm_base, res_base, cm_prop, res_prop, clases, out_dir):
+    """
+        Genera y guarda la comparativa lado a lado entre la matriz de confusión del baseline
+        y la del modelo propuesto con barra de color compartida.
+        Precondición:
+            - `cm_base` y `cm_prop` deben ser matrices cuadradas `(len(clases), len(clases))`.
+            - `res_base` y `res_prop` deben incluir las claves `"macro_f1"`, `"graded_f1"`,
+              `"qwk"` y `"acc_pm1"`.
+        Entradas:
+            cm_base (np.ndarray): Matriz de confusión del baseline en Test.
+            res_base (dict[str, float]): Métricas resumen del baseline.
+            cm_prop (np.ndarray): Matriz de confusión del modelo propuesto en Test.
+            res_prop (dict[str, float]): Métricas resumen del modelo propuesto.
+            clases (list[str]): Lista de clases en orden clínico.
+            out_dir (str): Carpeta destino donde se guardará la figura.
+        Salidas:
+            None.
+        Postcondición:
+            Exporta `rq1_matrices_comparativa.pdf` y `rq1_matrices_comparativa.png` en `out_dir`
+            y cierra la figura para liberar memoria.
+    """
     fig = plt.figure(figsize=(11.0, 5.1))
     gs = GridSpec(1, 3, width_ratios=[1.0, 1.0, 0.045], wspace=0.14, figure=fig)
     ax1 = fig.add_subplot(gs[0, 0])
@@ -408,6 +527,21 @@ def generar_matrices_comparativa(cm_base, res_base, cm_prop, res_prop, clases, o
 # PUNTO DE ENTRADA
 
 def parse_args():
+    """
+        Procesa los argumentos opcionales de línea de comandos para el script de gráficas.
+
+        Precondición:
+            Los argumentos presentes en `sys.argv` deben ser compatibles con las opciones
+            `--csv`, `--run_id` y `--out_dir`.
+        Entradas:
+            Ninguna por parámetro (lee directamente `sys.argv`).
+        Salidas:
+            argparse.Namespace: Objeto con los atributos `csv` (str | None), `run_id` (str | None)
+            y `out_dir` (str).
+        Postcondición:
+            Devuelve el `Namespace` parseado o finaliza el programa si hay error de sintaxis
+            o se solicita `--help`.
+    """
     parser = argparse.ArgumentParser(description="Generador de gráficas vectoriales para póster DIN-A3")
     parser.add_argument(
         "--csv",
@@ -428,8 +562,24 @@ def parse_args():
 
 
 def main():
+    """
+        Orquesta la configuración del estilo gráfico, la carga opcional de métricas desde CSV
+        y la generación de las tres figuras definitivas para el póster.
+
+        Precondición:
+            - Si se pasa `--csv`, el archivo debe existir y cumplir el esquema esperado por
+              `cargar_propuesto_desde_csv`.
+            - Debe existir permiso de escritura en `--out_dir`.
+        Entradas:
+            Ninguna por parámetro (lee opciones de consola y constantes globales del módulo).
+        Salidas:
+            None.
+        Postcondición:
+            Genera en `--out_dir` los archivos PDF y PNG (300 DPI) correspondientes a
+            `rq2_deteccion_temprana`, `rq1_matriz_propuesto` y `rq1_matrices_comparativa`.
+    """
     args = parse_args()
-    configurar_estilo_poster()
+    configurar_estilo()
 
     prop_data = (
         cargar_propuesto_desde_csv(args.csv, run_id=args.run_id)

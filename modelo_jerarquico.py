@@ -16,6 +16,18 @@ ORDEN_CLINICO = ["Supportive", "Indicator", "Ideation", "Behavior", "Attempt"]
 
 
 def fijar_semilla(seed=42):
+    """
+        Fija la semilla aleatoria en Python, NumPy y PyTorch (CPU y CUDA) para reproducibilidad.
+        Precondición:
+            `seed` debe ser un número entero no negativo.
+        Entradas:
+            seed (int): Semilla base para los generadores pseudoaleatorios.
+        Salidas:
+            None.
+        Postcondición:
+            Los estados de los generadores de `random`, `numpy.random`, `torch` y
+            `torch.cuda` (si hay GPU disponible) quedan inicializados con `seed`.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -24,7 +36,26 @@ def fijar_semilla(seed=42):
 
 
 def construir_textos_por_usuario(df_mensajes, col_post, col_label, label_to_idx):
-    """Agrupa los textos crudos en una lista cronológica por usuario."""
+    """
+    Agrupa los mensajes crudos de un DataFrame en secuencias cronológicas por usuario.
+    Precondición:
+        - `df_mensajes` debe contener las columnas `"user_id"`, `col_post` y `col_label`.
+        - Cada usuario debe tener al menos un mensaje y su etiqueta en `col_label` debe
+          existir como clave en `label_to_idx`.
+    Entradas:
+        df_mensajes (pd.DataFrame): DataFrame expandido con un mensaje por fila.
+        col_post (str): Nombre de la columna que contiene el texto del mensaje.
+        col_label (str): Nombre de la columna con la etiqueta clínica del usuario.
+        label_to_idx (dict[str, int]): Mapeo de nombre de clase a índice entero ordenado.
+    Salidas:
+        tuple[list[list[str]], np.ndarray, list]:
+            - `secuencias_texto`: lista de listas de textos por usuario.
+            - `etiquetas`: array NumPy `int64` con el índice de clase de cada usuario.
+            - `user_ids`: lista de identificadores de usuario en el mismo orden.
+    Postcondición:
+        Devuelve tres colecciones alineadas de longitud igual al número de usuarios
+        únicos presentes en `df_mensajes`, preservando el orden de aparición.
+    """
     secuencias_texto, etiquetas, user_ids = [], [], []
     for uid, grupo in df_mensajes.groupby("user_id", sort=False):
         secuencias_texto.append(grupo[col_post].astype(str).tolist())
@@ -36,9 +67,18 @@ def construir_textos_por_usuario(df_mensajes, col_post, col_label, label_to_idx)
 def calcular_metricas_graded(y_true, y_pred):
     """
     Calcula Graded Precision, Graded Recall y Graded F1 sobre etiquetas en orden clínico (0..4).
-    - TP: aciertos exactos (y_pred == y_true)
-    - FP_ord: suma de distancias en sobreestimaciones (y_pred > y_true)
-    - FN_ord: suma de distancias en subestimaciones (y_pred < y_true)
+    Precondición:
+        - `y_true` e `y_pred` deben tener la misma longitud y contener enteros
+          correspondientes a niveles ordinales crecientes de riesgo.
+    Entradas:
+        y_true (array-like[int]): Etiquetas reales en orden clínico.
+        y_pred (array-like[int]): Etiquetas predichas en orden clínico.
+    Salidas:
+        dict[str, float]: Diccionario con claves `"graded_p"`, `"graded_r"` y `"graded_f1"`,
+        todas en el rango `[0.0, 1.0]`.
+    Postcondición:
+        Penaliza las sobreestimaciones (`y_pred > y_true`) en precisión y las
+        subestimaciones (`y_pred < y_true`) en recall proporcionalmente a la distancia ordinal.
     """
     y_true = np.asarray(y_true, dtype=np.int64)
     y_pred = np.asarray(y_pred, dtype=np.int64)
@@ -54,14 +94,45 @@ def calcular_metricas_graded(y_true, y_pred):
 
 
 def crear_targets_sord(num_classes, sigma=0.38, device="cpu"):
-    """Soft Ordinal Targets (SORD): reparte masa suave solo a clases clínicas contiguas."""
+    """
+    Genera la matriz de objetivos ordinales suaves SORD (Soft Ordinal Targets).
+    Precondición:
+        `num_classes` debe ser un entero >= 2 y `sigma` un flotante estrictamente positivo.
+    Entradas:
+        num_classes (int): Número total de clases clínicas ordenadas.
+        sigma (float): Desviación estándar del kernel gaussiano ordinal.
+        device (str | torch.device): Dispositivo destino del tensor resultante.
+    Salidas:
+        torch.Tensor: Matriz flotante de forma `(num_classes, num_classes)` en `device`,
+        donde la fila `i` es la distribución de probabilidad suave para la clase `i`.
+    Postcondición:
+        Cada fila del tensor devuelto suma exactamente 1.0 y concentra la mayor masa
+        en la diagonal principal y las clases clínicamente contiguas.
+    """
     idx = torch.arange(num_classes, dtype=torch.float32, device=device)
     dist_sq = (idx.unsqueeze(1) - idx.unsqueeze(0)) ** 2
     return torch.softmax(-dist_sq / (2.0 * sigma ** 2), dim=1)
 
 
 class LoRALinear(nn.Module):
-    """Adaptador LoRA ligero en PyTorch puro sobre una capa nn.Linear congelada."""
+    """
+        Inicializa un adaptador LoRA sobre una capa `nn.Linear` congelada.
+
+        Precondición:
+            `base_layer` debe ser una instancia de `nn.Linear`, `r >= 1`, `alpha > 0`
+            y `0.0 <= dropout < 1.0`.
+        Entradas:
+            base_layer (nn.Linear): Capa lineal preentrenada original.
+            r (int): Rango de las matrices de descomposición de bajo rango.
+            alpha (float): Factor de escala LoRA.
+            dropout (float): Probabilidad de dropout aplicada a la entrada de la rama LoRA.
+        Salidas:
+            None.
+        Postcondición:
+            Todos los parámetros de `base_layer` quedan congelados (`requires_grad=False`),
+            `lora_A` se inicializa con Kaiming uniforme y `lora_B` a ceros para que la
+            capa inicie como función identidad respecto a `base_layer`.
+    """
 
     def __init__(self, base_layer, r=8, alpha=16.0, dropout=0.1):
         super().__init__()
@@ -78,6 +149,18 @@ class LoRALinear(nn.Module):
         nn.init.zeros_(self.lora_B.weight)
 
     def forward(self, x):
+        """
+        Calcula la transformación lineal base sumada a la corrección de bajo rango LoRA.
+         Precondición:
+               La última dimensión de `x` debe coincidir con `base_layer.in_features`.
+         Entradas:
+            x (torch.Tensor): Tensor de entrada de forma `(..., in_features)`.
+         Salidas:
+             torch.Tensor: Tensor de salida de forma `(..., out_features)`.
+         Postcondición:
+             Devuelve `base_layer(x) + (alpha / r) * lora_B(lora_A(dropout(x)))` sin
+             alterar los pesos congelados de `base_layer`.
+        """
         base_out = self.base_layer(x)
         lora_out = self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
         return base_out + lora_out
@@ -87,24 +170,81 @@ class MessageDataset(Dataset):
     """Dataset de mensajes individuales limpios (semilla.csv) para Multi-Task."""
 
     def __init__(self, textos, etiquetas):
+        """
+        Inicializa el dataset de mensajes individuales anotados (`semilla.csv`).
+        Precondición:
+           `textos` y `etiquetas` deben ser secuencias iterables de igual longitud.
+        Entradas:
+            textos (Sequence[str]): Lista de mensajes individuales.
+            etiquetas (Sequence[int]): Índices de clase correspondientes a cada mensaje.
+        Salidas:
+            None.
+        Postcondición:
+            Almacena copias en lista de `textos` y `etiquetas` listas para indexación.
+        """
         self.textos = list(textos)
         self.etiquetas = list(etiquetas)
 
     def __len__(self):
+        """
+        Devuelve el número total de mensajes del dataset.
+        Precondición:
+            El objeto `MessageDataset` debe estar inicializado.
+        Entradas:
+            Ninguna.
+        Salidas:
+           int: Cantidad de ejemplos almacenados.
+        Postcondición:
+            Devuelve un entero no negativo sin modificar el estado del dataset.
+        """
         return len(self.etiquetas)
 
     def __getitem__(self, idx):
+        """
+        Recupera el mensaje y la etiqueta entera en la posición `idx`.
+        Precondición:
+            `0 <= idx < len(self)`.
+        Entradas:
+            idx (int): Índice del ejemplo a recuperar.
+        Salidas:
+            tuple[str, int]: Par `(texto, etiqueta)`.
+        Postcondición:
+            Devuelve el texto convertido a `str` y la etiqueta convertida a `int`.
+        """
         return str(self.textos[idx]), int(self.etiquetas[idx])
 
 
 class CollateMessages:
-    """Tokeniza un mini-lote de mensajes individuales."""
 
     def __init__(self, tokenizer, max_length=384):
+        """
+        Configura la función de empaquetado y tokenización para lotes de mensajes individuales.
+        Precondición:
+            `tokenizer` debe ser un tokenizador compatible con Hugging Face y `max_length > 0`.
+        Entradas:
+            tokenizer: Tokenizador preentrenado del encoder.
+            max_length (int): Número máximo de tokens por mensaje.
+        Salidas:
+            None.
+        Postcondición:
+            Guarda `tokenizer` y `max_length` como atributos de la instancia invocable.
+        """
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __call__(self, batch):
+        """
+        Tokeniza y empaqueta un mini-lote de pares `(texto, etiqueta)`.
+        Precondición:
+            `batch` debe ser una lista no vacía de tuplas `(str, int)`.
+        Entradas:
+            batch (list[tuple[str, int]]): Mini-lote entregado por `DataLoader`.
+        Salidas:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            `(input_ids, attention_mask, etiquetas)` de longitud `len(batch)`.
+        Postcondición:
+            Devuelve tensores con padding dinámico y truncamiento a `self.max_length`.
+        """
         textos, etiquetas = zip(*batch)
         enc = self.tokenizer(
             list(textos),
@@ -121,9 +261,25 @@ class CollateMessages:
 
 
 class UserTextDataset(Dataset):
-    """Dataset de secuencias por usuario con Message Dropout leve en entrenamiento."""
 
     def __init__(self, secuencias_texto, etiquetas, max_msgs=32, msg_dropout=0.10, training=True):
+        """
+        Inicializa el dataset de secuencias de mensajes por usuario.
+        Precondición:
+            - `secuencias_texto` y `etiquetas` deben tener igual longitud.
+            - Cada elemento de `secuencias_texto` debe ser una lista no vacía de textos.
+            - `0.0 <= msg_dropout < 1.0` y `max_msgs` es `None` o un entero >= 1.
+        Entradas:
+            secuencias_texto (list[list[str]]): Mensajes cronológicos por usuario.
+            etiquetas (array-like[int]): Etiqueta clínica por usuario.
+            max_msgs (int | None): Tope máximo de mensajes conservados por usuario.
+            msg_dropout (float): Probabilidad de descartar cada mensaje en entrenamiento.
+            training (bool): Activa el muestreo aleatorio y el dropout de mensajes.
+        Salidas:
+            None.
+        Postcondición:
+            Almacena las secuencias y configuración de muestreo en la instancia.
+        """
         self.secuencias_texto = secuencias_texto
         self.etiquetas = etiquetas
         self.max_msgs = max_msgs
@@ -131,9 +287,33 @@ class UserTextDataset(Dataset):
         self.training = training
 
     def __len__(self):
+        """
+        Devuelve el número total de usuarios en el dataset.
+        Precondición:
+            El objeto `UserTextDataset` debe estar inicializado.
+        Entradas:
+            Ninguna.
+        Salidas:
+            int: Cantidad de usuarios almacenados.
+        Postcondición:
+            Devuelve un entero no negativo sin alterar el estado interno.
+        """
         return len(self.etiquetas)
 
     def __getitem__(self, idx):
+        """
+        Obtiene la secuencia de mensajes (con dropout y submuestreo opcionales) y la etiqueta del usuario `idx`.
+
+        Precondición:
+            `0 <= idx < len(self)` y `secuencias_texto[idx]` contiene al menos 1 mensaje.
+        Entradas:
+            idx (int): Índice del usuario.
+        Salidas:
+            tuple[list[str], int]: Par `(mensajes, etiqueta)`.
+        Postcondición:
+            Devuelve una lista no vacía de mensajes respetando el orden cronológico relativo
+            y acotada a `max_msgs` si está definido, sin mutar la lista original.
+        """
         mensajes = list(self.secuencias_texto[idx])
 
         if self.training and self.msg_dropout > 0 and len(mensajes) >= 8:
@@ -152,13 +332,38 @@ class UserTextDataset(Dataset):
 
 
 class CollateUserTexts:
-    """Aplana los mensajes de los usuarios del batch y los tokeniza de golpe."""
-
     def __init__(self, tokenizer, max_length=384):
+        """
+        Configura la función de empaquetado para mini-lotes de secuencias de usuarios.
+        Precondición:
+            `tokenizer` debe ser un tokenizador compatible con Hugging Face y `max_length > 0`.
+        Entradas:
+            tokenizer: Tokenizador preentrenado del encoder.
+            max_length (int): Límite máximo de tokens por mensaje.
+        Salidas:
+            None.
+        Postcondición:
+            Almacena el tokenizador y la longitud máxima en la instancia.
+        """
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __call__(self, batch):
+        """
+        Aplana todos los mensajes de los usuarios del lote y los tokeniza en una sola llamada.
+        Precondición:
+            `batch` debe ser una lista no vacía de pares `(lista_mensajes, etiqueta)`,
+            donde cada `lista_mensajes` tiene al menos un texto.
+        Entradas:
+            batch (list[tuple[list[str], int]]): Mini-lote de usuarios.
+        Salidas:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                `(input_ids, attention_mask, longitudes, etiquetas)` donde
+                `input_ids.size(0) == longitudes.sum().item()`.
+        Postcondición:
+            Devuelve los tensores tokenizados con padding dinámico y el vector de
+            longitudes necesario para reconstruir cada usuario tras el encoder.
+        """
         listas_mensajes, etiquetas = zip(*batch)
         longitudes = torch.tensor([len(m) for m in listas_mensajes], dtype=torch.long)
         mensajes_planos = [msg for lista in listas_mensajes for msg in lista]
@@ -175,10 +380,6 @@ class CollateUserTexts:
 
 
 class HierarchicalMentalRoBERTaMIL(nn.Module):
-    """
-    MentalRoBERTa con LoRA + Token Attention Pooling + BiLSTM residual
-    + Clasificador por mensaje + Agregación MIL (Softmax-Weighted Pooling + Media).
-    """
 
     def __init__(
         self,
@@ -194,6 +395,32 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         dropout=0.4,
         multi_sample_dropout_n=5,
     ):
+        """
+        Construye la arquitectura jerárquica MentalRoBERTa-LoRA + Token Attention + BiLSTM + MIL.
+        Precondición:
+            - `model_name` debe corresponder a un modelo RoBERTa/Transformer accesible
+              localmente o en Hugging Face.
+            - `0 <= lora_layers <= num_capas_encoder`, `lora_r >= 1`, `hidden_dim >= 1`,
+              `num_classes >= 2` y `0.0 <= dropout < 1.0`.
+        Entradas:
+            model_name (str): Identificador del encoder base.
+            lora_layers (int): Número de capas finales del encoder adaptadas con LoRA.
+            lora_r (int): Rango LoRA.
+            lora_alpha (float): Factor de escala LoRA.
+            lora_dropout (float): Dropout en la rama LoRA.
+            lora_include_out (bool): Si es `True`, aplica LoRA también a `attention.output.dense`.
+            grad_checkpointing (bool): Activa recomputación de activaciones para ahorrar VRAM.
+            hidden_dim (int): Dimensión oculta por dirección de la BiLSTM.
+            num_classes (int): Número de clases clínicas de salida.
+            dropout (float): Tasa de dropout en proyección y cabeza clasificadora.
+            multi_sample_dropout_n (int): Número de máscaras en Multi-Sample Dropout.
+        Salidas:
+            None.
+        Postcondición:
+            El encoder queda congelado salvo los adaptadores LoRA, `token_attn` inicia a
+            ceros (equivalente a mean-pooling) y `user_combiner` inicia con pesos 0.7/0.3
+            sobre `mil_peak` y `mil_mean`.
+        """
         super().__init__()
         self.num_classes = num_classes
         self.multi_sample_dropout_n = max(1, int(multi_sample_dropout_n))
@@ -243,6 +470,19 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
             self.user_combiner.weight[:, num_classes:] = 0.3 * eye
 
     def _activar_checkpointing(self):
+        """
+        Activa el checkpointing de activaciones/gradientes en el encoder Transformer.
+        Precondición:
+            `self.encoder` debe estar inicializado y soportar `activation_checkpointing_enable`
+            o `gradient_checkpointing_enable`.
+        Entradas:
+            Ninguna.
+        Salidas:
+            None.
+        Postcondición:
+            Desactiva `use_cache` si existe, activa el checkpointing no reentrante en el
+            encoder y habilita gradientes en los embeddings de entrada para compatibilidad con LoRA.
+        """
         if hasattr(self.encoder.config, "use_cache"):
             self.encoder.config.use_cache = False
         if hasattr(self.encoder, "activation_checkpointing_enable"):
@@ -262,6 +502,23 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         self.encoder.enable_input_require_grads()
 
     def _aplicar_lora(self, lora_layers, r, alpha, dropout, include_out=True):
+        """
+        Congela todos los parámetros del encoder e inyecta capas `LoRALinear` en las últimas capas.
+        Precondición:
+            `self.encoder` debe tener la estructura `encoder.layer` con subcapas
+            `attention.self.query`, `attention.self.value` y `attention.output.dense`.
+        Entradas:
+            lora_layers (int): Número de capas finales donde inyectar LoRA.
+            r (int): Rango LoRA.
+            alpha (float): Escala LoRA.
+            dropout (float): Dropout interno de LoRA.
+            include_out (bool): Indica si se envuelve también `attention.output.dense`.
+        Salidas:
+            None.
+        Postcondición:
+            Únicamente los pesos `lora_A` y `lora_B` de las últimas `lora_layers` capas
+            mantienen `requires_grad=True` dentro de `self.encoder`.
+        """
         for p in self.encoder.parameters():
             p.requires_grad = False
 
@@ -279,7 +536,18 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
                     )
 
     def trainable_state_dict(self):
-        """Devuelve solo los pesos entrenables (~2 MB) en CPU."""
+        """
+        Extrae un diccionario clonado en CPU únicamente con los parámetros entrenables del modelo.
+        Precondición:
+            El modelo debe estar instanciado con los flags `requires_grad` correctamente configurados.
+        Entradas:
+            Ninguna.
+        Salidas:
+            dict[str, torch.Tensor]: Subconjunto de `state_dict()` limitado a parámetros entrenables.
+        Postcondición:
+            Devuelve tensores desacoplados del grafo (`detach`) y copiados en CPU (~2 MB),
+            sin modificar el dispositivo ni los pesos del modelo activo.
+        """
         trainable_keys = {n for n, p in self.named_parameters() if p.requires_grad}
         return {
             k: v.detach().cpu().clone()
@@ -288,7 +556,18 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         }
 
     def encode_messages(self, input_ids, attention_mask, use_bf16=True):
-        """Vectoriza mensajes con LoRA-MentalRoBERTa y atención sobre tokens reales."""
+        """
+        Extrae un diccionario clonado en CPU únicamente con los parámetros entrenables del modelo.
+        Precondición:
+            El modelo debe estar instanciado con los flags `requires_grad` correctamente configurados.
+        Entradas:
+            Ninguna.
+        Salidas:
+            dict[str, torch.Tensor]: Subconjunto de `state_dict()` limitado a parámetros entrenables.
+        Postcondición:
+            Devuelve tensores desacoplados del grafo (`detach`) y copiados en CPU (~2 MB),
+            sin modificar el dispositivo ni los pesos del modelo activo.
+        """
         autocast_ctx = (
             torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
             if use_bf16 and input_ids.is_cuda
@@ -305,7 +584,18 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         return (hidden_f32 * weights).sum(dim=1)
 
     def _clasificar_representaciones_msg(self, h):
-        """Aplica el clasificador por mensaje con Multi-Sample Dropout en entrenamiento."""
+        """
+        Extrae un diccionario clonado en CPU únicamente con los parámetros entrenables del modelo.
+        Precondición:
+            El modelo debe estar instanciado con los flags `requires_grad` correctamente configurados.
+        Entradas:
+            Ninguna.
+        Salidas:
+            dict[str, torch.Tensor]: Subconjunto de `state_dict()` limitado a parámetros entrenables.
+        Postcondición:
+            Devuelve tensores desacoplados del grafo (`detach`) y copiados en CPU (~2 MB),
+            sin modificar el dispositivo ni los pesos del modelo activo.
+        """
         if self.training and self.multi_sample_dropout_n > 1:
             return torch.stack(
                 [self.msg_classifier(self.head_dropout(h)) for _ in range(self.multi_sample_dropout_n)],
@@ -316,7 +606,20 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         return self.msg_classifier(h)
 
     def forward_messages(self, input_ids, attention_mask, use_bf16=True):
-        """Rama Multi-Task a nivel de mensaje individual (para semilla.csv)."""
+        """
+        Ejecuta la rama Multi-Task a nivel de mensaje individual (para `semilla.csv`).
+        Precondición:
+            `input_ids` y `attention_mask` deben tener forma `(B, L)` en el dispositivo del modelo.
+        Entradas:
+            input_ids (torch.Tensor): Identificadores de tokens de mensajes semilla `(B, L)`.
+            attention_mask (torch.Tensor): Máscara de tokens válidos `(B, L)`.
+            use_bf16 (bool): Activa `autocast` en `bfloat16` en CUDA.
+        Salidas:
+            torch.Tensor: Logits por mensaje de forma `(B, num_classes)`.
+        Postcondición:
+            Reutiliza el encoder, proyección, BiLSTM residual y `msg_classifier` compartidos
+            con la rama de usuario.
+        """
         msg_embs = self.encode_messages(input_ids, attention_mask, use_bf16=use_bf16)
         x = self.proj(msg_embs).unsqueeze(1)
         lstm_out, _ = self.bilstm(x)
@@ -324,7 +627,23 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         return self._clasificar_representaciones_msg(h)
 
     def forward_from_embeddings(self, x_pad, longitudes):
-        """Clasifica secuencias ya vectorizadas mediante MIL Softmax-Weighted + Media."""
+        """
+        Procesa secuencias ya vectorizadas de usuarios mediante BiLSTM residual y agregación MIL.
+        Precondición:
+            - `x_pad` debe tener forma `(U, M_max, emb_dim)` en el dispositivo del modelo.
+            - `longitudes` debe ser un tensor 1D de enteros positivos con longitud `U` y
+              valores `<= M_max`.
+        Entradas:
+            x_pad (torch.Tensor): Secuencias de embeddings con padding `(U, M_max, emb_dim)`.
+            longitudes (torch.Tensor): Número real de mensajes por usuario `(U,)`.
+        Salidas:
+            tuple[torch.Tensor, torch.Tensor]:
+                - `user_logits`: logits a nivel de usuario `(U, num_classes)`.
+                - `msg_logits`: logits por mensaje `(U, M_max, num_classes)`.
+        Postcondición:
+            Combina evidencia pico (MIL Softmax-Weighted Pooling con temperatura aprendible)
+            y media enmascarada ignorando cualquier posición de padding.
+        """
         x = self.proj(x_pad)
 
         packed = pack_padded_sequence(
@@ -356,14 +675,45 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
         return user_logits, msg_logits
 
     def forward(self, input_ids, attention_mask, longitudes, use_bf16=True):
+        """
+        Ejecuta el paso hacia adelante completo desde tokens planos hasta logits de usuario y mensaje.
+        Precondición:
+            - `input_ids` y `attention_mask` tienen forma `(N_total, L)` en el dispositivo del modelo.
+            - `longitudes` contiene enteros positivos cuya suma es exactamente `N_total`.
+        Entradas:
+            input_ids (torch.Tensor): Tokens de todos los mensajes del lote `(N_total, L)`.
+            attention_mask (torch.Tensor): Máscara de tokens válidos `(N_total, L)`.
+            longitudes (torch.Tensor): Mensajes por cada usuario del lote `(U,)`.
+            use_bf16 (bool): Activa `autocast` en `bfloat16` en CUDA.
+        Salidas:
+            tuple[torch.Tensor, torch.Tensor]: `(user_logits, msg_logits)`.
+        Postcondición:
+            Agrupa los embeddings codificados por usuario respetando `longitudes` y
+            devuelve las predicciones jerárquicas completas.
+        """
         msg_embs = self.encode_messages(input_ids, attention_mask, use_bf16=use_bf16)
         splits = torch.split(msg_embs, longitudes.tolist(), dim=0)
         x_pad = pad_sequence(splits, batch_first=True, padding_value=0.0)
         return self.forward_from_embeddings(x_pad, longitudes)
 
 
-def guardar_checkpoint_mil(model, ruta, config_modelo, clases, metricas, hiperparametros=None):
-    """Guarda los pesos entrenables (LoRA + cabeza MIL) junto con configuración y métricas."""
+def guardar_modelo_mil(model, ruta, config_modelo, clases, metricas, hiperparametros=None):
+    """
+    Ejecuta el paso hacia adelante completo desde tokens planos hasta logits de usuario y mensaje.
+    Precondición:
+        - `input_ids` y `attention_mask` tienen forma `(N_total, L)` en el dispositivo del modelo.
+        - `longitudes` contiene enteros positivos cuya suma es exactamente `N_total`.
+    Entradas:
+        input_ids (torch.Tensor): Tokens de todos los mensajes del lote `(N_total, L)`.
+        attention_mask (torch.Tensor): Máscara de tokens válidos `(N_total, L)`.
+        longitudes (torch.Tensor): Mensajes por cada usuario del lote `(U,)`.
+        use_bf16 (bool): Activa `autocast` en `bfloat16` en CUDA.
+    Salidas:
+        tuple[torch.Tensor, torch.Tensor]: `(user_logits, msg_logits)`.
+    Postcondición:
+        Agrupa los embeddings codificados por usuario respetando `longitudes` y
+        devuelve las predicciones jerárquicas completas.
+    """
     directorio = os.path.dirname(ruta)
     if directorio:
         os.makedirs(directorio, exist_ok=True)
@@ -377,8 +727,23 @@ def guardar_checkpoint_mil(model, ruta, config_modelo, clases, metricas, hiperpa
     torch.save(payload, ruta)
 
 
-def cargar_checkpoint_mil(ruta, device="cpu"):
-    """Reconstruye HierarchicalMentalRoBERTaMIL desde un checkpoint ligero guardado."""
+def cargar_modelo_mil(ruta, device="cpu"):
+    """
+    Ejecuta el paso hacia adelante completo desde tokens planos hasta logits de usuario y mensaje.
+    Precondición:
+        - `input_ids` y `attention_mask` tienen forma `(N_total, L)` en el dispositivo del modelo.
+        - `longitudes` contiene enteros positivos cuya suma es exactamente `N_total`.
+    Entradas:
+        input_ids (torch.Tensor): Tokens de todos los mensajes del lote `(N_total, L)`.
+        attention_mask (torch.Tensor): Máscara de tokens válidos `(N_total, L)`.
+        longitudes (torch.Tensor): Mensajes por cada usuario del lote `(U,)`.
+        use_bf16 (bool): Activa `autocast` en `bfloat16` en CUDA.
+    Salidas:
+        tuple[torch.Tensor, torch.Tensor]: `(user_logits, msg_logits)`.
+    Postcondición:
+        Agrupa los embeddings codificados por usuario respetando `longitudes` y
+        devuelve las predicciones jerárquicas completas.
+    """
     try:
         ckpt = torch.load(ruta, map_location="cpu", weights_only=False)
     except TypeError:
@@ -396,7 +761,26 @@ def cargar_checkpoint_mil(ruta, device="cpu"):
 def extraer_secuencias_con_encoder(
     model, secuencias_texto, tokenizer, device, max_length=384, msg_batch_size=64, use_bf16=True
 ):
-    """Vectoriza una sola vez todos los mensajes de Val/Test con el encoder actual."""
+    """
+    Vectoriza en modo inferencia todos los mensajes de un conjunto de usuarios en una sola pasada.
+    Precondición:
+        - `secuencias_texto` debe ser una lista no vacía de secuencias no vacías de textos.
+        - `model` debe encontrarse en `device` y `msg_batch_size >= 1`.
+    Entradas:
+        model (HierarchicalMentalRoBERTaMIL): Modelo con el encoder a utilizar.
+        secuencias_texto (list[list[str]]): Mensajes cronológicos por usuario.
+        tokenizer: Tokenizador compatible con el encoder del modelo.
+        device (torch.device): Dispositivo de inferencia.
+        max_length (int): Longitud máxima de tokens por mensaje.
+        msg_batch_size (int): Tamaño de lote de mensajes por pasada del encoder.
+        use_bf16 (bool): Activa `autocast` en `bfloat16` en CUDA.
+    Salidas:
+        list[torch.Tensor]: Lista de tensores en CPU de forma `(n_msgs_u, emb_dim)`,
+        uno por cada usuario en el mismo orden que `secuencias_texto`.
+    Postcondición:
+        Deja `model` en modo evaluación sin construir grafo de gradientes y devuelve los
+        embeddings listos para evaluar múltiples ventanas `k` sin recodificar textos.
+    """
     model.eval()
     longitudes = [len(s) for s in secuencias_texto]
     todos_mensajes = [msg for s in secuencias_texto for msg in s]
@@ -426,7 +810,26 @@ def extraer_secuencias_con_encoder(
 def evaluar_secuencias_emb(
     model, secuencias_emb, etiquetas, device, max_mensajes=None, batch_size=32
 ):
-    """Evalúa la cabeza MIL truncando a los primeros `max_mensajes` (RQ2)."""
+    """
+    Vectoriza en modo inferencia todos los mensajes de un conjunto de usuarios en una sola pasada.
+    Precondición:
+        - `secuencias_texto` debe ser una lista no vacía de secuencias no vacías de textos.
+        - `model` debe encontrarse en `device` y `msg_batch_size >= 1`.
+    Entradas:
+        model (HierarchicalMentalRoBERTaMIL): Modelo con el encoder a utilizar.
+        secuencias_texto (list[list[str]]): Mensajes cronológicos por usuario.
+        tokenizer: Tokenizador compatible con el encoder del modelo.
+        device (torch.device): Dispositivo de inferencia.
+        max_length (int): Longitud máxima de tokens por mensaje.
+        msg_batch_size (int): Tamaño de lote de mensajes por pasada del encoder.
+        use_bf16 (bool): Activa `autocast` en `bfloat16` en CUDA.
+    Salidas:
+        list[torch.Tensor]: Lista de tensores en CPU de forma `(n_msgs_u, emb_dim)`,
+        uno por cada usuario en el mismo orden que `secuencias_texto`.
+    Postcondición:
+        Deja `model` en modo evaluación sin construir grafo de gradientes y devuelve los
+        embeddings listos para evaluar múltiples ventanas `k` sin recodificar textos.
+    """
     model.eval()
     sec_eval = (
         [s[:max_mensajes] for s in secuencias_emb]
@@ -516,7 +919,65 @@ def entrenar_jerarquico_mil(
     patience=6,
     seed=42,
 ):
-    """Entrena MentalRoBERTa-LoRA + MIL + Multi-Task + Top-2 Checkpoint Soup."""
+    """
+    Entrena un modelo `HierarchicalMentalRoBERTaMIL` con Balanced Softmax + SORD,
+    Multi-Task opcional con semillas, early stopping compuesto y Top-2 Model Soup.
+    Precondición:
+        - `train_texts`/`train_labels` y `val_texts`/`val_labels` deben ser no vacíos y
+          alineados en longitud, con etiquetas enteras en `[0, len(clases) - 1]`.
+        - Si se pasan `seed_texts` y `seed_labels` con `seed_alpha > 0`, deben tener igual
+          longitud y contener etiquetas válidas en `[0, len(clases) - 1]`.
+        - `epochs >= 1`, `patience >= 1`, `batch_size >= 1`, `accum_steps >= 1` y
+          `0.0 <= early_stop_auc_weight <= 1.0`.
+    Entradas:
+        train_texts (list[list[str]]): Secuencias de mensajes de entrenamiento por usuario.
+        train_labels (np.ndarray): Etiquetas de entrenamiento en orden clínico.
+        val_texts (list[list[str]]): Secuencias de mensajes de validación por usuario.
+        val_labels (np.ndarray): Etiquetas de validación en orden clínico.
+        clases (list[str]): Lista de nombres de clases en orden clínico.
+        tokenizer: Tokenizador del encoder preentrenado.
+        device (torch.device): Dispositivo de entrenamiento (`cuda` o `cpu`).
+        seed_texts (list[str] | None): Mensajes individuales limpios para la rama Multi-Task.
+        seed_labels (np.ndarray | None): Etiquetas de los mensajes semilla.
+        seed_alpha (float): Peso inicial de la pérdida auxiliar Multi-Task.
+        seed_alpha_decay (float): Fracción de decaimiento lineal de `seed_alpha` a lo largo de las épocas.
+        sord_seed_sigma (float): Sigma SORD aplicado a la rama de mensajes semilla.
+        seed_batch_size (int): Tamaño de lote para los mensajes semilla.
+        model_name (str): Identificador del encoder base.
+        lora_layers (int): Capas finales del encoder con adaptadores LoRA.
+        lora_r (int): Rango LoRA.
+        lora_alpha (float): Factor de escala LoRA.
+        lora_dropout (float): Dropout de LoRA.
+        lora_include_out (bool): Incluye proyección de salida de atención en LoRA.
+        grad_checkpointing (bool): Activa checkpointing de activaciones en el encoder.
+        hidden_dim (int): Dimensión oculta por dirección de la BiLSTM.
+        dropout (float): Dropout de la cabeza jerárquica.
+        multi_sample_dropout_n (int): Número de máscaras en Multi-Sample Dropout.
+        max_length (int): Longitud máxima en tokens por mensaje.
+        max_msgs_train (int): Tope de mensajes por usuario durante entrenamiento.
+        msg_dropout (float): Probabilidad de descartar mensajes en entrenamiento.
+        batch_size (int): Usuarios por micro-lote.
+        accum_steps (int): Pasos de acumulación de gradientes.
+        lr_lora (float): Tasa de aprendizaje para los parámetros LoRA.
+        lr_head (float): Tasa de aprendizaje para la cabeza secuencial MIL.
+        lora_weight_decay (float): Decaimiento de pesos para LoRA.
+        head_weight_decay (float): Decaimiento de pesos para la cabeza MIL.
+        warmup_ratio (float): Proporción de pasos iniciales de warmup del scheduler coseno.
+        tau (float): Escalar de ajuste de priors en Balanced Softmax.
+        sord_sigma (float): Sigma del suavizado ordinal SORD a nivel de usuario.
+        early_stop_auc_weight (float): Peso del AUC en la métrica compuesta de parada temprana.
+        use_top2_soup (bool): Si es `True`, evalúa el promedio de pesos de las 2 mejores épocas.
+        epochs (int): Número máximo de épocas de entrenamiento.
+        patience (int): Épocas consecutivas sin mejora antes de detener el entrenamiento.
+        seed (int): Semilla aleatoria del fold.
+    Salidas:
+        tuple[HierarchicalMentalRoBERTaMIL, float, float, float, str]:
+            `(model, mejor_f1_val, mejor_gf1_val, mejor_auc_real, mejor_epoca)`.
+    Postcondición:
+        Devuelve el modelo en `device` cargado con los pesos de la mejor época individual
+        o del promedio Top-2 Soup (solo si iguala o mejora el score compuesto en validación)
+        y libera la lista temporal de estados guardados.
+    """
     fijar_semilla(seed)
     use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
     num_classes = len(clases)
