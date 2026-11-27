@@ -14,7 +14,7 @@ def cascading_self_training(
     X_unlabeled,
     y_unlabeled_orig,
     textos_unlabeled,
-    umbrales=(0.95, 0.90, 0.85, 0.80, 0.75),
+    umbrales=(0.95, 0.90, 0.85, 0.80, 0.75, 0.70),
     max_iter_interna=10,
     factor_balanceo=2,
     min_palabras=8,

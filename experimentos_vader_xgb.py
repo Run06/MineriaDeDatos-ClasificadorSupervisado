@@ -1,11 +1,7 @@
 import argparse
 import json
-import os
-
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-import seaborn as sns
+
 from sklearn.metrics import cohen_kappa_score, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.svm import SVC
@@ -90,7 +86,6 @@ def entrenar_modelo(tipo_modelo, X_tr, y_tr, usar_pesos=True, random_state=42, r
         return clf, clases_unicas
 
     if tipo_modelo == "xgb":
-        num_clases = len(clases_unicas)
         cfg_xgb = cfg_modelos["xgb"]
         num_clases = len(clases_unicas)
         clf = XGBClassifier(
