@@ -557,16 +557,18 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
 
     def encode_messages(self, input_ids, attention_mask, use_bf16=True):
         """
-        Extrae un diccionario clonado en CPU únicamente con los parámetros entrenables del modelo.
+        Codifica un lote de mensajes mediante MentalRoBERTa-LoRA y Token Attention Pooling.
         Precondición:
-            El modelo debe estar instanciado con los flags `requires_grad` correctamente configurados.
+            `input_ids` y `attention_mask` deben tener forma `(N, L)` en el dispositivo del modelo.
         Entradas:
-            Ninguna.
+            input_ids (torch.Tensor): Identificadores de tokens `(N, L)`.
+            attention_mask (torch.Tensor): Máscara de tokens válidos `(N, L)`.
+            use_bf16 (bool): Activa `autocast` en `bfloat16` si el tensor está en CUDA.
         Salidas:
-            dict[str, torch.Tensor]: Subconjunto de `state_dict()` limitado a parámetros entrenables.
+            torch.Tensor: Embeddings densos por mensaje de forma `(N, emb_dim)` en `float32`.
         Postcondición:
-            Devuelve tensores desacoplados del grafo (`detach`) y copiados en CPU (~2 MB),
-            sin modificar el dispositivo ni los pesos del modelo activo.
+            Pondera cada token válido mediante `token_attn` (enmascarando el padding) y
+            devuelve un único vector por mensaje.
         """
         autocast_ctx = (
             torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -585,16 +587,18 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
 
     def _clasificar_representaciones_msg(self, h):
         """
-        Extrae un diccionario clonado en CPU únicamente con los parámetros entrenables del modelo.
+        Codifica un lote de mensajes mediante MentalRoBERTa-LoRA y Token Attention Pooling.
         Precondición:
-            El modelo debe estar instanciado con los flags `requires_grad` correctamente configurados.
+            `input_ids` y `attention_mask` deben tener forma `(N, L)` en el dispositivo del modelo.
         Entradas:
-            Ninguna.
+            input_ids (torch.Tensor): Identificadores de tokens `(N, L)`.
+            attention_mask (torch.Tensor): Máscara de tokens válidos `(N, L)`.
+            use_bf16 (bool): Activa `autocast` en `bfloat16` si el tensor está en CUDA.
         Salidas:
-            dict[str, torch.Tensor]: Subconjunto de `state_dict()` limitado a parámetros entrenables.
+            torch.Tensor: Embeddings densos por mensaje de forma `(N, emb_dim)` en `float32`.
         Postcondición:
-            Devuelve tensores desacoplados del grafo (`detach`) y copiados en CPU (~2 MB),
-            sin modificar el dispositivo ni los pesos del modelo activo.
+            Pondera cada token válido mediante `token_attn` (enmascarando el padding) y
+            devuelve un único vector por mensaje.
         """
         if self.training and self.multi_sample_dropout_n > 1:
             return torch.stack(
@@ -699,20 +703,18 @@ class HierarchicalMentalRoBERTaMIL(nn.Module):
 
 def guardar_modelo_mil(model, ruta, config_modelo, clases, metricas, hiperparametros=None):
     """
-    Ejecuta el paso hacia adelante completo desde tokens planos hasta logits de usuario y mensaje.
-    Precondición:
-        - `input_ids` y `attention_mask` tienen forma `(N_total, L)` en el dispositivo del modelo.
-        - `longitudes` contiene enteros positivos cuya suma es exactamente `N_total`.
-    Entradas:
-        input_ids (torch.Tensor): Tokens de todos los mensajes del lote `(N_total, L)`.
-        attention_mask (torch.Tensor): Máscara de tokens válidos `(N_total, L)`.
-        longitudes (torch.Tensor): Mensajes por cada usuario del lote `(U,)`.
-        use_bf16 (bool): Activa `autocast` en `bfloat16` en CUDA.
-    Salidas:
-        tuple[torch.Tensor, torch.Tensor]: `(user_logits, msg_logits)`.
-    Postcondición:
-        Agrupa los embeddings codificados por usuario respetando `longitudes` y
-        devuelve las predicciones jerárquicas completas.
+        Codifica un lote de mensajes mediante MentalRoBERTa-LoRA y Token Attention Pooling.
+        Precondición:
+            `input_ids` y `attention_mask` deben tener forma `(N, L)` en el dispositivo del modelo.
+        Entradas:
+            input_ids (torch.Tensor): Identificadores de tokens `(N, L)`.
+            attention_mask (torch.Tensor): Máscara de tokens válidos `(N, L)`.
+            use_bf16 (bool): Activa `autocast` en `bfloat16` si el tensor está en CUDA.
+        Salidas:
+            torch.Tensor: Embeddings densos por mensaje de forma `(N, emb_dim)` en `float32`.
+        Postcondición:
+            Pondera cada token válido mediante `token_attn` (enmascarando el padding) y
+            devuelve un único vector por mensaje.
     """
     directorio = os.path.dirname(ruta)
     if directorio:
@@ -811,24 +813,24 @@ def evaluar_secuencias_emb(
     model, secuencias_emb, etiquetas, device, max_mensajes=None, batch_size=32
 ):
     """
-    Vectoriza en modo inferencia todos los mensajes de un conjunto de usuarios en una sola pasada.
+    Evalúa el modelo sobre secuencias de embeddings ya extraídas, aplicando un corte opcional
+    a los primeros `max_mensajes` (ventana estática `[:k]`) por usuario.
     Precondición:
-        - `secuencias_texto` debe ser una lista no vacía de secuencias no vacías de textos.
-        - `model` debe encontrarse en `device` y `msg_batch_size >= 1`.
+        - `secuencias_emb` y `etiquetas` deben ser no vacíos y tener la misma longitud.
+        - `model` debe estar en `device` y `batch_size >= 1`.
     Entradas:
-        model (HierarchicalMentalRoBERTaMIL): Modelo con el encoder a utilizar.
-        secuencias_texto (list[list[str]]): Mensajes cronológicos por usuario.
-        tokenizer: Tokenizador compatible con el encoder del modelo.
+        model (HierarchicalMentalRoBERTaMIL): Modelo jerárquico a evaluar.
+        secuencias_emb (list[torch.Tensor]): Lista de tensores `(n_msgs_u, emb_dim)` por usuario.
+        etiquetas (array-like[int]): Etiquetas reales en orden clínico.
         device (torch.device): Dispositivo de inferencia.
-        max_length (int): Longitud máxima de tokens por mensaje.
-        msg_batch_size (int): Tamaño de lote de mensajes por pasada del encoder.
-        use_bf16 (bool): Activa `autocast` en `bfloat16` en CUDA.
+        max_mensajes (int | None): Límite máximo de mensajes leídos por usuario (`None` = todos).
+        batch_size (int): Número de usuarios por lote de evaluación.
     Salidas:
-        list[torch.Tensor]: Lista de tensores en CPU de forma `(n_msgs_u, emb_dim)`,
-        uno por cada usuario en el mismo orden que `secuencias_texto`.
+        dict[str, object]: Diccionario con `macro_f1`, `weighted_f1`, `graded_p`, `graded_r`,
+        `graded_f1`, `kappa`, `qwk`, `auc`, `media_msgs`, `y_true`, `y_pred` e `y_prob`.
     Postcondición:
-        Deja `model` en modo evaluación sin construir grafo de gradientes y devuelve los
-        embeddings listos para evaluar múltiples ventanas `k` sin recodificar textos.
+        Deja `model` en modo evaluación sin construir grafo de gradientes y devuelve todas
+        las métricas agregadas junto con las predicciones y probabilidades por usuario.
     """
     model.eval()
     sec_eval = (
