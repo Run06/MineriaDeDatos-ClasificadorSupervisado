@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from itertools import cycle
 import math
 import random
 import numpy as np
@@ -35,8 +36,8 @@ def calcular_metricas_graded(y_true, y_pred):
     """
     Calcula Graded Precision, Graded Recall y Graded F1 sobre etiquetas en orden clínico (0..4).
     - TP: aciertos exactos (y_pred == y_true)
-    - FP_ord: suma de distancias en sobreestimaciones (y_pred > y_true)
-    - FN_ord: suma de distancias en subestimaciones (y_pred < y_true)
+    - FP_ord: suma de distancias en sobreestimaciones (y_pred mayor que y_true)
+    - FN_ord: suma de distancias en subestimaciones (y_pred menor que y_true)
     """
     y_true = np.asarray(y_true, dtype=np.int64)
     y_pred = np.asarray(y_pred, dtype=np.int64)
@@ -52,35 +53,101 @@ def calcular_metricas_graded(y_true, y_pred):
 
 
 def crear_targets_sord(num_classes, sigma=0.45, device="cpu"):
-    """
-    Soft Ordinal Targets (SORD): mantiene ~92% de masa en extremos y ~86% en centro,
-    cediendo ~7-8% solo a vecinos inmediatos y 0% a clases lejanas.
-    """
+    """Soft Ordinal Targets (SORD): reparte masa suave solo a clases clínicas contiguas."""
     idx = torch.arange(num_classes, dtype=torch.float32, device=device)
     dist_sq = (idx.unsqueeze(1) - idx.unsqueeze(0)) ** 2
     return torch.softmax(-dist_sq / (2.0 * sigma ** 2), dim=1)
 
 
-class UserTextDataset(Dataset):
-    """Dataset de secuencias de mensajes crudos por usuario."""
+class LoRALinear(nn.Module):
+    """Adaptador LoRA ligero en PyTorch puro sobre una capa nn.Linear congelada."""
 
-    def __init__(self, secuencias_texto, etiquetas, max_msgs=24, training=True):
+    def __init__(self, base_layer, r=8, alpha=16.0, dropout=0.1):
+        super().__init__()
+        self.base_layer = base_layer
+        for p in self.base_layer.parameters():
+            p.requires_grad = False
+
+        self.scaling = alpha / r
+        self.lora_dropout = nn.Dropout(dropout)
+        self.lora_A = nn.Linear(base_layer.in_features, r, bias=False)
+        self.lora_B = nn.Linear(r, base_layer.out_features, bias=False)
+
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x):
+        base_out = self.base_layer(x)
+        lora_out = self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+        return base_out + lora_out
+
+
+class MessageDataset(Dataset):
+    """Dataset de mensajes individuales limpios (semilla.csv) para Multi-Task."""
+
+    def __init__(self, textos, etiquetas):
+        self.textos = list(textos)
+        self.etiquetas = list(etiquetas)
+
+    def __len__(self):
+        return len(self.etiquetas)
+
+    def __getitem__(self, idx):
+        return str(self.textos[idx]), int(self.etiquetas[idx])
+
+
+class CollateMessages:
+    """Tokeniza un mini-lote de mensajes individuales."""
+
+    def __init__(self, tokenizer, max_length=256):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __call__(self, batch):
+        textos, etiquetas = zip(*batch)
+        enc = self.tokenizer(
+            list(textos),
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        return (
+            enc["input_ids"],
+            enc["attention_mask"],
+            torch.tensor(etiquetas, dtype=torch.long),
+        )
+
+
+class UserTextDataset(Dataset):
+    """Dataset de secuencias por usuario con Message Dropout leve en entrenamiento."""
+
+    def __init__(self, secuencias_texto, etiquetas, max_msgs=32, msg_dropout=0.10, training=True):
         self.secuencias_texto = secuencias_texto
         self.etiquetas = etiquetas
         self.max_msgs = max_msgs
+        self.msg_dropout = msg_dropout
         self.training = training
 
     def __len__(self):
         return len(self.etiquetas)
 
     def __getitem__(self, idx):
-        mensajes = self.secuencias_texto[idx]
+        mensajes = list(self.secuencias_texto[idx])
+
+        # Message Dropout leve solo en historiales largos para regularizar sin borrar posts únicos
+        if self.training and self.msg_dropout > 0 and len(mensajes) >= 8:
+            filtrados = [m for m in mensajes if random.random() >= self.msg_dropout]
+            if len(filtrados) >= 4:
+                mensajes = filtrados
+
         if self.max_msgs is not None and len(mensajes) > self.max_msgs:
             if self.training:
                 indices = sorted(random.sample(range(len(mensajes)), self.max_msgs))
                 mensajes = [mensajes[i] for i in indices]
             else:
                 mensajes = mensajes[: self.max_msgs]
+
         return mensajes, int(self.etiquetas[idx])
 
 
@@ -107,62 +174,85 @@ class CollateUserTexts:
         return enc["input_ids"], enc["attention_mask"], longitudes, etiquetas
 
 
-class HierarchicalMentalRoBERTa(nn.Module):
+class HierarchicalMentalRoBERTaMIL(nn.Module):
     """
-    Vectorizador MentalRoBERTa (últimas capas descongeladas) + Token Attention Pooling
-    + Proyección + BiLSTM + Fusión (Atención aditiva + Max-Pooling por mensaje)
-    + Multi-Sample Dropout.
+    MentalRoBERTa con LoRA (últimas capas) + Token Attention Pooling
+    + Proyección + BiLSTM residual + Clasificador a nivel de mensaje (compartido con semillas)
+    + Agregación MIL (LogSumExp por clase + Media de logits).
     """
 
     def __init__(
         self,
         model_name="mental/mental-roberta-base",
-        unfreeze_layers=2,
+        lora_layers=6,
+        lora_r=8,
+        lora_alpha=16.0,
+        lora_dropout=0.1,
         proj_dim=64,
         hidden_dim=32,
         num_classes=5,
         dropout=0.4,
     ):
         super().__init__()
+        self.num_classes = num_classes
         self.encoder = AutoModel.from_pretrained(model_name)
-        self._configurar_capas_entrenables(unfreeze_layers)
+        self._aplicar_lora(lora_layers, lora_r, lora_alpha, lora_dropout)
 
         emb_dim = self.encoder.config.hidden_size
-        # Inicializado a 0 -> en época 1 equivale a mean_pool exacto y se especializa sin desestabilizar
+
+        # Atención sobre tokens inicializada a 0 (arranca exactamente como mean_pool)
         self.token_attn = nn.Linear(emb_dim, 1)
         nn.init.zeros_(self.token_attn.weight)
         nn.init.zeros_(self.token_attn.bias)
 
+        # proj_dim == hidden_dim * 2 para conexión residual limpia con la BiLSTM
+        seq_dim = hidden_dim * 2
         self.proj = nn.Sequential(
-            nn.Linear(emb_dim, proj_dim),
-            nn.LayerNorm(proj_dim),
+            nn.Linear(emb_dim, seq_dim),
+            nn.LayerNorm(seq_dim),
             nn.GELU(),
             nn.Dropout(dropout),
         )
         self.bilstm = nn.LSTM(
-            input_size=proj_dim,
+            input_size=seq_dim,
             hidden_size=hidden_dim,
             num_layers=1,
             batch_first=True,
             bidirectional=True,
         )
-        self.attn_proj = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.attn_score = nn.Linear(hidden_dim, 1, bias=False)
-
+        self.seq_norm = nn.LayerNorm(seq_dim)
         self.head_dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(hidden_dim * 4, num_classes)
 
-    def _configurar_capas_entrenables(self, unfreeze_layers):
+        # Clasificador a nivel de mensaje (compartido entre secuencias de usuario y semillas)
+        self.msg_classifier = nn.Linear(seq_dim, num_classes)
+
+        # Temperatura aprendible por clase para LogSumExp MIL (beta inicial ~3.58)
+        self.raw_beta = nn.Parameter(torch.full((1, 1, num_classes), 2.5))
+
+        # Fusión ligera (55 params): combina evidencia pico (LogSumExp) y tono medio (Mean)
+        self.user_combiner = nn.Linear(num_classes * 2, num_classes)
+        with torch.no_grad():
+            self.user_combiner.weight.zero_()
+            self.user_combiner.bias.zero_()
+            eye = torch.eye(num_classes)
+            self.user_combiner.weight[:, :num_classes] = 0.7 * eye
+            self.user_combiner.weight[:, num_classes:] = 0.3 * eye
+
+    def _aplicar_lora(self, lora_layers, r, alpha, dropout):
         for p in self.encoder.parameters():
             p.requires_grad = False
 
-        if unfreeze_layers > 0:
-            for capa in self.encoder.encoder.layer[-unfreeze_layers:]:
-                for p in capa.parameters():
-                    p.requires_grad = True
+        if lora_layers > 0:
+            for capa in self.encoder.encoder.layer[-lora_layers:]:
+                capa.attention.self.query = LoRALinear(
+                    capa.attention.self.query, r=r, alpha=alpha, dropout=dropout
+                )
+                capa.attention.self.value = LoRALinear(
+                    capa.attention.self.value, r=r, alpha=alpha, dropout=dropout
+                )
 
     def encode_messages(self, input_ids, attention_mask, use_bf16=True):
-        """Vectoriza mensajes con atención aprendida sobre tokens reales (arranca como mean-pool)."""
+        """Vectoriza mensajes con LoRA-MentalRoBERTa y atención sobre tokens reales."""
         autocast_ctx = (
             torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
             if use_bf16 and input_ids.is_cuda
@@ -178,8 +268,24 @@ class HierarchicalMentalRoBERTa(nn.Module):
         weights = torch.softmax(scores, dim=1).unsqueeze(-1)
         return (hidden_f32 * weights).sum(dim=1)
 
+    def _clasificar_representaciones_msg(self, h):
+        """Aplica el clasificador por mensaje con Multi-Sample Dropout en entrenamiento."""
+        if self.training:
+            return torch.stack(
+                [self.msg_classifier(self.head_dropout(h)) for _ in range(5)], dim=0
+            ).mean(dim=0)
+        return self.msg_classifier(h)
+
+    def forward_messages(self, input_ids, attention_mask, use_bf16=True):
+        """Rama Multi-Task a nivel de mensaje individual (para semilla.csv)."""
+        msg_embs = self.encode_messages(input_ids, attention_mask, use_bf16=use_bf16)
+        x = self.proj(msg_embs).unsqueeze(1)  # (B, 1, seq_dim)
+        lstm_out, _ = self.bilstm(x)
+        h = self.seq_norm(lstm_out + x).squeeze(1)
+        return self._clasificar_representaciones_msg(h)
+
     def forward_from_embeddings(self, x_pad, longitudes):
-        """Clasifica secuencias ya vectorizadas usando Multi-Sample Dropout en Train."""
+        """Clasifica secuencias ya vectorizadas mediante MIL LogSumExp + Media."""
         x = self.proj(x_pad)
 
         packed = pack_padded_sequence(
@@ -189,31 +295,27 @@ class HierarchicalMentalRoBERTa(nn.Module):
         lstm_out, _ = pad_packed_sequence(
             packed_out, batch_first=True, total_length=x.size(1)
         )
+        h = self.seq_norm(lstm_out + x)
+
+        # Logits de riesgo por cada mensaje individual del usuario: (B, T, 5)
+        msg_logits = self._clasificar_representaciones_msg(h)
 
         max_len = x.size(1)
         mask = torch.arange(max_len, device=x.device).unsqueeze(0) < longitudes.unsqueeze(1)
+        long_f = longitudes.float().clamp(min=1.0).view(-1, 1)
 
-        # 1. Contexto por Atención aditiva entre mensajes
-        scores = self.attn_score(torch.tanh(self.attn_proj(lstm_out))).squeeze(-1)
-        scores = scores.masked_fill(~mask, -1e9)
-        attn_weights = torch.softmax(scores, dim=1)
-        context_attn = torch.bmm(attn_weights.unsqueeze(1), lstm_out).squeeze(1)
+        # 1. MIL Softmax-Weighted Pooling por clase (invariante a la longitud del historial)
+        beta = nn.functional.softplus(self.raw_beta) + 1.0  # (1, 1, 5)
+        scores_mil = (msg_logits * beta).masked_fill(~mask.unsqueeze(-1), -1e9)
+        weights_mil = torch.softmax(scores_mil, dim=1)
+        mil_peak = (weights_mil * msg_logits).sum(dim=1)
 
-        # 2. Contexto por Max-Pooling sobre mensajes
-        lstm_masked = lstm_out.masked_fill(~mask.unsqueeze(-1), -1e9)
-        context_max = lstm_masked.max(dim=1).values
+        # 2. Media enmascarada de logits (captura tono global del historial)
+        mask_f = mask.unsqueeze(-1).float()
+        mil_mean = (msg_logits * mask_f).sum(dim=1) / long_f
 
-        context = torch.cat([context_attn, context_max], dim=1)
-
-        # Multi-Sample Dropout (5 máscaras en paralelo, 0 parámetros extra)
-        if self.training:
-            logits = torch.stack(
-                [self.classifier(self.head_dropout(context)) for _ in range(5)], dim=0
-            ).mean(dim=0)
-        else:
-            logits = self.classifier(context)
-
-        return logits, attn_weights
+        user_logits = self.user_combiner(torch.cat([mil_peak, mil_mean], dim=1))
+        return user_logits, msg_logits
 
     def forward(self, input_ids, attention_mask, longitudes, use_bf16=True):
         msg_embs = self.encode_messages(input_ids, attention_mask, use_bf16=use_bf16)
@@ -226,7 +328,7 @@ class HierarchicalMentalRoBERTa(nn.Module):
 def extraer_secuencias_con_encoder(
     model, secuencias_texto, tokenizer, device, max_length=256, msg_batch_size=64, use_bf16=True
 ):
-    """Vectoriza una sola vez todos los mensajes de Dev/Test con el encoder actual."""
+    """Vectoriza una sola vez todos los mensajes de Val/Test con el encoder actual."""
     model.eval()
     longitudes = [len(s) for s in secuencias_texto]
     todos_mensajes = [msg for s in secuencias_texto for msg in s]
@@ -256,7 +358,7 @@ def extraer_secuencias_con_encoder(
 def evaluar_secuencias_emb(
     model, secuencias_emb, etiquetas, device, max_mensajes=None, batch_size=32
 ):
-    """Evalúa la cabeza BiLSTM + Attention truncando a los primeros `max_mensajes` (RQ2)."""
+    """Evalúa la cabeza MIL truncando a los primeros `max_mensajes` (RQ2)."""
     model.eval()
     sec_eval = (
         [s[:max_mensajes] for s in secuencias_emb]
@@ -304,76 +406,112 @@ def evaluar_secuencias_emb(
     }
 
 
-def entrenar_jerarquico(
+def entrenar_jerarquico_mil(
     train_texts,
     train_labels,
-    dev_texts,
-    dev_labels,
+    val_texts,
+    val_labels,
     clases,
     tokenizer,
     device,
+    seed_texts=None,
+    seed_labels=None,
+    seed_alpha=0.35,
+    seed_batch_size=16,
     model_name="mental/mental-roberta-base",
-    unfreeze_layers=2,
-    proj_dim=64,
+    lora_layers=6,
+    lora_r=8,
+    lora_alpha=16.0,
     hidden_dim=32,
     dropout=0.4,
     max_length=256,
-    max_msgs_train=24,
+    max_msgs_train=32,
+    msg_dropout=0.10,
     batch_size=2,
     accum_steps=8,
-    lr_encoder=3e-5,
+    lr_lora=3e-4,
     lr_head=1e-3,
     weight_decay=2e-2,
-    weight_power=1.0,
+    tau=1.0,
     sord_sigma=0.45,
     epochs=25,
     patience=6,
     seed=42,
 ):
-    """Entrena MentalRoBERTa (parcial) + Token Attn + BiLSTM + Balanced Softmax + SORD."""
+    """Entrena MentalRoBERTa-LoRA + MIL LogSumExp + Multi-Task con semillas limpias."""
     fijar_semilla(seed)
     use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    num_classes = len(clases)
 
-    model = HierarchicalMentalRoBERTa(
+    model = HierarchicalMentalRoBERTaMIL(
         model_name=model_name,
-        unfreeze_layers=unfreeze_layers,
-        proj_dim=proj_dim,
+        lora_layers=lora_layers,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
         hidden_dim=hidden_dim,
-        num_classes=len(clases),
+        num_classes=num_classes,
         dropout=dropout,
     ).to(device)
 
     total_p = sum(p.numel() for p in model.parameters())
     train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainable_keys = {n for n, p in model.named_parameters() if p.requires_grad}
+    usar_semillas = seed_texts is not None and len(seed_texts) > 0 and seed_alpha > 0
     print(
-        f"Parámetros entrenables: {train_p:,} / {total_p:,} "
-        f"({100 * train_p / total_p:.1f}%) | bfloat16={use_bf16} | tau={weight_power} | sord_sigma={sord_sigma}"
+        f"Parámetros entrenables: {train_p:,} / {total_p:,} ({100 * train_p / total_p:.2f}%) | "
+        f"LoRA(capas={lora_layers}, r={lora_r}) | Multi-Task semillas="
+        f"{len(seed_texts) if usar_semillas else 0} (alpha={seed_alpha if usar_semillas else 0.0})"
     )
 
     train_loader = DataLoader(
-        UserTextDataset(train_texts, train_labels, max_msgs=max_msgs_train, training=True),
+        UserTextDataset(
+            train_texts,
+            train_labels,
+            max_msgs=max_msgs_train,
+            msg_dropout=msg_dropout,
+            training=True,
+        ),
         batch_size=batch_size,
         shuffle=True,
         collate_fn=CollateUserTexts(tokenizer, max_length=max_length),
     )
 
-    # Balanced Softmax + Soft Ordinal Targets (SORD)
-    conteos = np.bincount(train_labels, minlength=len(clases)).astype(np.float32)
+    # Balanced Softmax + SORD para usuarios
+    conteos = np.bincount(train_labels, minlength=num_classes).astype(np.float32)
     priors = conteos / conteos.sum()
     log_priors = torch.tensor(np.log(np.clip(priors, 1e-12, 1.0)), dtype=torch.float32, device=device)
-    tau = weight_power
-    sord_matrix = crear_targets_sord(len(clases), sigma=sord_sigma, device=device)
+    sord_user = crear_targets_sord(num_classes, sigma=sord_sigma, device=device)
 
-    encoder_params = [p for p in model.encoder.parameters() if p.requires_grad]
+    # Loader auxiliar de mensajes semilla para entrenamiento Multi-Task
+    seed_iter = None
+    log_seed_priors = None
+    sord_seed = None
+    if usar_semillas:
+        seed_loader = DataLoader(
+            MessageDataset(seed_texts, seed_labels),
+            batch_size=seed_batch_size,
+            shuffle=True,
+            collate_fn=CollateMessages(tokenizer, max_length=max_length),
+        )
+        seed_iter = cycle(seed_loader)
+        conteos_s = np.bincount(seed_labels, minlength=num_classes).astype(np.float32)
+        priors_s = conteos_s / conteos_s.sum()
+        log_seed_priors = torch.tensor(
+            np.log(np.clip(priors_s, 1e-12, 1.0)), dtype=torch.float32, device=device
+        )
+        sord_seed = crear_targets_sord(num_classes, sigma=0.40, device=device)
+
+    lora_params = [
+        p for n, p in model.named_parameters() if n.startswith("encoder.") and p.requires_grad
+    ]
     head_params = [
         p for n, p in model.named_parameters() if not n.startswith("encoder.") and p.requires_grad
     ]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": encoder_params, "lr": lr_encoder, "weight_decay": 0.01},
-            {"params": head_params, "lr": lr_head, "weight_decay": weight_decay},
-        ]
-    )
+    param_groups = []
+    if lora_params:
+        param_groups.append({"params": lora_params, "lr": lr_lora, "weight_decay": 0.01})
+    param_groups.append({"params": head_params, "lr": lr_head, "weight_decay": weight_decay})
+    optimizer = torch.optim.AdamW(param_groups)
 
     steps_por_epoca = math.ceil(len(train_loader) / accum_steps)
     total_steps = steps_por_epoca * epochs
@@ -385,15 +523,18 @@ def entrenar_jerarquico(
 
     mejor_score = -1.0
     mejor_auc_real = 0.0
-    mejor_f1_dev = 0.0
-    mejor_gf1_dev = 0.0
+    mejor_f1_val = 0.0
+    mejor_gf1_val = 0.0
     mejor_estado = None
     sin_mejora = 0
 
     for epoca in range(1, epochs + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss_acum = 0.0
+        loss_user_acum = 0.0
+        loss_seed_acum = 0.0
+        n_seed_steps = 0
+        alpha_ep = seed_alpha * (1.0 - 0.75 * (epoca - 1) / max(1, epochs - 1))
 
         for step, (input_ids, attention_mask, longitudes, y) in enumerate(train_loader, start=1):
             input_ids = input_ids.to(device)
@@ -403,39 +544,61 @@ def entrenar_jerarquico(
 
             logits, _ = model(input_ids, attention_mask, longitudes, use_bf16=use_bf16)
             log_probs = nn.functional.log_softmax(logits + tau * log_priors, dim=1)
-            y_soft = sord_matrix[y]
-            loss = -(y_soft * log_probs).sum(dim=1).mean() / accum_steps
-            loss.backward()
-            loss_acum += loss.item() * accum_steps
+            loss_u = -(sord_user[y] * log_probs).sum(dim=1).mean() / accum_steps
+            loss_u.backward()
+            loss_user_acum += loss_u.item() * accum_steps
 
             if step % accum_steps == 0 or step == len(train_loader):
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # Paso auxiliar Multi-Task con 1 mini-lote de semillas limpias por actualización
+                if usar_semillas:
+                    s_ids, s_mask, s_y = next(seed_iter)
+                    s_ids = s_ids.to(device)
+                    s_mask = s_mask.to(device)
+                    s_y = s_y.to(device)
+
+                    s_logits = model.forward_messages(s_ids, s_mask, use_bf16=use_bf16)
+                    s_log_probs = nn.functional.log_softmax(s_logits + tau * log_seed_priors, dim=1)
+                    loss_s = -(sord_seed[s_y] * s_log_probs).sum(dim=1).mean()
+                    (alpha_ep * loss_s).backward()
+                    loss_seed_acum += loss_s.item()
+                    n_seed_steps += 1
+
+                nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], max_norm=1.0
+                )
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
-        dev_embs = extraer_secuencias_con_encoder(
-            model, dev_texts, tokenizer, device, max_length=max_length, use_bf16=use_bf16
+        val_embs = extraer_secuencias_con_encoder(
+            model, val_texts, tokenizer, device, max_length=max_length, use_bf16=use_bf16
         )
-        res_dev = evaluar_secuencias_emb(model, dev_embs, dev_labels, device, max_mensajes=None)
+        res_val = evaluar_secuencias_emb(model, val_embs, val_labels, device, max_mensajes=None)
         score_actual = (
-            0.5 * res_dev["auc"] + 0.5 * res_dev["macro_f1"]
-            if not np.isnan(res_dev["auc"])
-            else res_dev["macro_f1"]
+            0.5 * res_val["auc"] + 0.5 * res_val["macro_f1"]
+            if not np.isnan(res_val["auc"])
+            else res_val["macro_f1"]
         )
 
+        seed_msg = (
+            f" | LossS: {loss_seed_acum / max(1, n_seed_steps):.4f}" if usar_semillas else ""
+        )
         print(
-            f"    Época {epoca:02d}/{epochs} | Loss: {loss_acum / len(train_loader):.4f} "
-            f"| Dev AUC: {res_dev['auc']:.4f} | Dev F1: {res_dev['macro_f1']:.4f} "
-            f"| Dev Graded F1: {res_dev['graded_f1']:.4f}"
+            f"    Época {epoca:02d}/{epochs} | LossU: {loss_user_acum / len(train_loader):.4f}"
+            f"{seed_msg} | Val AUC: {res_val['auc']:.4f} | Val F1: {res_val['macro_f1']:.4f} "
+            f"| Val GF1: {res_val['graded_f1']:.4f}"
         )
 
         if score_actual > mejor_score:
             mejor_score = score_actual
-            mejor_auc_real = res_dev["auc"]
-            mejor_f1_dev = res_dev["macro_f1"]
-            mejor_gf1_dev = res_dev["graded_f1"]
-            mejor_estado = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            mejor_auc_real = res_val["auc"]
+            mejor_f1_val = res_val["macro_f1"]
+            mejor_gf1_val = res_val["graded_f1"]
+            mejor_estado = {
+                k: v.detach().cpu().clone()
+                for k, v in model.state_dict().items()
+                if k in trainable_keys
+            }
             sin_mejora = 0
         else:
             sin_mejora += 1
@@ -444,7 +607,7 @@ def entrenar_jerarquico(
                 break
 
     if mejor_estado is not None:
-        model.load_state_dict(mejor_estado)
+        model.load_state_dict(mejor_estado, strict=False)
         del mejor_estado
 
-    return model, mejor_f1_dev, mejor_gf1_dev, mejor_auc_real
+    return model, mejor_f1_val, mejor_gf1_val, mejor_auc_real
