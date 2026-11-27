@@ -1,3 +1,4 @@
+import json
 from sklearn.metrics import classification_report, f1_score
 from sklearn.svm import SVC
 import numpy as np
@@ -34,7 +35,7 @@ def predecir_por_usuario(scores_mensajes, clases,df_mensajes,col_label,max_mensa
 
     return y_true_users, y_pred_users, float(np.mean(mensajes_leidos))
 
-def entrenar_y_evaluar(titulo, X_tr, y_tr, X_dev_vec, dev_msgs, X_test_vec, test_msgs, col_label,ventanas_k=(1,3,5,10,None)):
+def entrenar_y_evaluar(titulo, X_tr, y_tr, X_dev_vec, dev_msgs, X_test_vec, test_msgs, col_label,ventanas_k=(1,3,5,10,None),ruta_config="config.json"):
     """
     - Precondiciones: X_tr e y_tr no estan vacios; las dimensiones de X_dev_vec y X_test_vec coinciden con X_tr.
     - Entradas: titulo (str), X_tr (np.ndarray), y_tr (array), X_dev_vec (np.ndarray),
@@ -42,11 +43,13 @@ def entrenar_y_evaluar(titulo, X_tr, y_tr, X_dev_vec, dev_msgs, X_test_vec, test
     - Salidas: Ninguna.
     - Postcondiciones: Entrena un SVM RBF balanceado, evalua distintas ventanas k en Dev y Test e imprime el reporte final.
     """
+    with open(ruta_config, "r", encoding="utf-8") as f:
+        cfg_svm = json.load(f)["modelos"]["svm"]
     print(f"MODELO: {titulo} (Train: {len(y_tr)} mensajes)")
     svc_model = SVC(
-        kernel="rbf",
-        C=2.0,
-        gamma="scale",
+        kernel=cfg_svm["kernel"],
+        C=cfg_svm["C"],
+        gamma=cfg_svm["gamma"],
         class_weight="balanced",
         random_state=42,
     )

@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 
 import matplotlib.pyplot as plt
@@ -61,15 +62,15 @@ def emparejar_vader_con_embeddings(
     return X_tr_vader
 
 
-def entrenar_modelo(
-    tipo_modelo, X_tr, y_tr, usar_pesos=True, random_state=42
-):
+def entrenar_modelo(tipo_modelo, X_tr, y_tr, usar_pesos=True, random_state=42, ruta_config="config.json"):
     """
     - Precondiciones: tipo_modelo es 'svm', 'xgb' o 'logistic', X_tr es matriz 2D y len(X_tr) == len(y_tr) > 0.
     - Entradas: tipo_modelo (str), X_tr (np.ndarray), y_tr (array de etiquetas), usar_pesos (bool) y random_state (int).
     - Salidas: tupla (clf, clases_unicas) con el modelo entrenado y las etiquetas ordenadas.
     - Postcondiciones: El clasificador queda ajustado sobre X_tr e y_tr listo para predecir.
     """
+    with open(ruta_config, "r", encoding="utf-8") as f:
+        cfg_modelos = json.load(f)["modelos"]
     #Convertimos etiquetas de texto a indices enteros
     clases_unicas = np.unique(y_tr)
     idx_map = {c: i for i, c in enumerate(clases_unicas)}
@@ -77,10 +78,11 @@ def entrenar_modelo(
     pesos = compute_sample_weight(class_weight="balanced", y=y_idx) if usar_pesos else None
 
     if tipo_modelo == "svm":
+        cfg_svm = cfg_modelos["svm"]
         clf = SVC(
-            kernel="rbf",
-            C=2.0,
-            gamma="scale",
+            kernel=cfg_svm["kernel"],
+            C=cfg_svm["C"],
+            gamma=cfg_svm["gamma"],
             class_weight="balanced" if usar_pesos else None,
             random_state=random_state,
         )
@@ -89,12 +91,14 @@ def entrenar_modelo(
 
     if tipo_modelo == "xgb":
         num_clases = len(clases_unicas)
+        cfg_xgb = cfg_modelos["xgb"]
+        num_clases = len(clases_unicas)
         clf = XGBClassifier(
-            n_estimators=250,
-            max_depth=5,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
+            n_estimators=cfg_xgb["n_estimators"],
+            max_depth=cfg_xgb["max_depth"],
+            learning_rate=cfg_xgb["learning_rate"],
+            subsample=cfg_xgb["subsample"],
+            colsample_bytree=cfg_xgb["colsample_bytree"],
             eval_metric="mlogloss" if num_clases > 2 else "logloss",
             random_state=random_state,
             n_jobs=-1,
@@ -567,10 +571,7 @@ def ejecutar_experimento_semilla(raw_data, semillas_df, args, seed_run):
         y_seed=y_seed,
         X_unlabeled=X_reddit_emb,
         y_unlabeled_orig=y_train.values,
-        textos_unlabeled=X_train.values,
-        umbrales=(0.95, 0.90, 0.85, 0.80, 0.75, 0.70),
-        max_iter_interna=10,
-        factor_balanceo=2,
+        textos_unlabeled=X_train.values
     )
 
     #Elegimos el conjunto de entrenamiento pedido por consola

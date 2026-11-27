@@ -1,7 +1,12 @@
 import hashlib
 import os
+import json
 import numpy as np
 from sklearn.linear_model import LogisticRegression
+
+def cargar_config(ruta="config.json"):
+    with open(ruta, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 def cascading_self_training(
     X_seed,
@@ -25,6 +30,12 @@ def cascading_self_training(
     - Salidas: tupla (X_clean, y_clean, X_full, y_full) con los conjuntos limpio (semillas + pseudo-etiquetados) y completo.
     - Postcondiciones: Devuelve (y guarda en cache si aplica) las matrices y etiquetas resultantes del autoentrenamiento en cascada.
     """
+    cfg_re = cargar_config()["re_etiquetado"]
+    umbrales = tuple(cfg_re["umbrales"]) if umbrales is None else umbrales
+    max_iter_interna = cfg_re["max_iter_interna"] if max_iter_interna is None else max_iter_interna
+    factor_balanceo = cfg_re["factor_balanceo"] if factor_balanceo is None else factor_balanceo
+    min_palabras = cfg_re["min_palabras"] if min_palabras is None else min_palabras
+    random_state = cfg_re["random_state"] if random_state is None else random_state
     # --- CACHÉ ---
     ruta_cache = None
     if cache_dir is not None:
@@ -54,12 +65,13 @@ def cascading_self_training(
     X_pseudo_bloques = []
     y_pseudo_bloques = []
 
+    cfg_lr = cfg_re["modelo_maestro"]
     modelo_maestro = LogisticRegression(
-        class_weight="balanced",
+        class_weight=cfg_lr["class_weight"],
         random_state=random_state,
-        max_iter=500,
-        C=1.0,
-        solver="lbfgs",
+        max_iter=cfg_lr["max_iter"],
+        C=cfg_lr["C"],
+        solver=cfg_lr["solver"],
     )
 
     necesita_reentrenar = True

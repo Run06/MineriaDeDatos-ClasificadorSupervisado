@@ -1,0 +1,29 @@
+{
+  "re_etiquetado": {
+    "umbrales": [0.95, 0.90, 0.85, 0.80, 0.75, 0.70],
+    "max_iter_interna": 10,
+    "factor_balanceo": 2,
+    "min_palabras": 8,
+    "random_state": 42,
+    "modelo_maestro": {
+      "class_weight": "balanced",
+      "max_iter": 500,
+      "C": 1.0,
+      "solver": "lbfgs"
+    }
+  },
+  "modelos": {
+    "svm": {
+      "kernel": "rbf",
+      "C": 2.0,
+      "gamma": "scale"
+    },
+    "xgb": {
+      "n_estimators": 250,
+      "max_depth": 5,
+      "learning_rate": 0.05,
+      "subsample": 0.8,
+      "colsample_bytree": 0.8
+    }
+  }
+}

@@ -96,10 +96,7 @@ def main():
         y_seed=y_seed,
         X_unlabeled=X_reddit_vec,
         y_unlabeled_orig=y_train.values,
-        textos_unlabeled=X_train.values,
-        umbrales=(0.95, 0.90, 0.85, 0.80, 0.75,0.70),
-        max_iter_interna=10,
-        factor_balanceo=2,
+        textos_unlabeled=X_train.values
     )
 
     entrenar_y_evaluar(
