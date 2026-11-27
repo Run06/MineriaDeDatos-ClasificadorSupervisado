@@ -504,7 +504,7 @@ def leer_argumentos():
     parser.add_argument("--seed-target", default=None, help="Columna de texto en semilla.csv (por defecto usa 'Post' si existe, si no --target)",)
     parser.add_argument("--conjunto-train", choices=["sin_pseudo", "clean", "full"], default="full", help="Elige entre 'sin_pseudo', 'clean' o 'full'",)
     parser.add_argument("--orden-gravedad", nargs="+", default=["Supportive", "Indicator", "Ideation", "Behavior", "Attempt"], help="Etiquetas ordenadas de menor a mayor gravedad",)
-    parser.add_argument("--runs", type=int, default=3, help="Numero de repeticiones con distintas semillas",)
+    parser.add_argument("--runs", type=int, default=1, help="Numero de repeticiones con distintas semillas",)
     return parser.parse_args()
 
 
@@ -515,26 +515,13 @@ def ejecutar_experimento_semilla(raw_data, semillas_df, args, seed_run):
     - Salidas: tupla (df_metricas, modelos, test_msgs, n_emb) con resultados del run, modelos entrenados y datos de test.
     - Postcondiciones: Particiona por usuario, vectoriza, entrena los 5 modelos y devuelve sus metricas en Dev y Test.
     """
-    #Particionamos primero por usuario para no mezclar mensajes del mismo autor entre splits
-    col_user = "User" if "User" in raw_data.columns else ("user_id" if "user_id" in raw_data.columns else None)
-    if col_user is not None:
-        usuarios_unicos = raw_data.drop_duplicates(col_user)[[col_user, args.label]]
-        tr_u, te_u = train_test_split(
-            usuarios_unicos, test_size=0.15, random_state=seed_run, stratify=usuarios_unicos[args.label]
-        )
-        tr_u, dev_u = train_test_split(
-            tr_u, test_size=(15 / 85), random_state=seed_run, stratify=tr_u[args.label]
-        )
-        train_users = raw_data[raw_data[col_user].isin(tr_u[col_user])].copy()
-        dev_users = raw_data[raw_data[col_user].isin(dev_u[col_user])].copy()
-        test_users = raw_data[raw_data[col_user].isin(te_u[col_user])].copy()
-    else:
-        train_users, test_users = train_test_split(
-            raw_data, test_size=0.15, random_state=seed_run, stratify=raw_data[args.label]
-        )
-        train_users, dev_users = train_test_split(
-            train_users, test_size=(15 / 85), random_state=seed_run, stratify=train_users[args.label]
-        )
+    #Split
+    train_users, test_users = train_test_split(
+        raw_data, test_size=0.15, random_state=seed_run, stratify=raw_data[args.label]
+    )
+    train_users, dev_users = train_test_split(
+        train_users, test_size=(15 / 85), random_state=seed_run, stratify=train_users[args.label]
+    )
 
     #Separamos las listas de posts en mensajes individuales
     train_msgs = dividir_mensajes(train_users, col_post=args.target)
@@ -613,9 +600,15 @@ def ejecutar_experimento_semilla(raw_data, semillas_df, args, seed_run):
         clf, clases = entrenar_modelo(tipo, x_tr, y_tr, random_state=seed_run)
         s_dev = obtener_puntuaciones(clf, x_dev)
         s_test = obtener_puntuaciones(clf, x_test)
-        mejor_k_dev, f1_dev_por_k = buscar_mejor_k_dev(
-            s_dev, clases, dev_msgs, args.label, ventanas
+        #mejor_k_dev, f1_dev_por_k = buscar_mejor_k_dev(s_dev, clases, dev_msgs, args.label, ventanas) #Interesante a futuro
+        #Para mantener baseline:
+        mejor_k_dev = None
+        y_dev_u, preds_dev_u, _ = predecir_por_usuario(
+            s_dev, clases, dev_msgs, args.label, max_mensajes=mejor_k_dev
         )
+        f1_dev_por_k = {
+            mejor_k_dev: float(f1_score(y_dev_u, preds_dev_u, average="macro", zero_division=0))
+        }
         y_test_u, preds_test_u, _ = predecir_por_usuario(
             s_test, clases, test_msgs, args.label, max_mensajes=mejor_k_dev
         )
